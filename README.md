@@ -33,6 +33,10 @@ via a smoothstep transition controlled by `--softness`.
 A **saturation gate** protects low-saturation pixels (grey, white, black) from being keyed,
 even if their chromaticity happens to land near the key color.
 
+## CLI output
+
+Terminal output uses [Rich](https://github.com/Textualize/rich) for styled help (`rich-argparse`), inline progress bars during frame processing, and formatted tracebacks. The shared console lives in `console.py`.
+
 ## Architecture
 
 Single-file pipeline (`main.py`) with three WGSL compute shaders (`alpha_hint.wgsl`, `blur.wgsl`, `morphology.wgsl`). All textures are `rgba8unorm`.

@@ -5,6 +5,9 @@ import numpy as np
 import wgpu
 import wgpu.utils
 from PIL import Image
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+
+from console import console, log
 
 
 def load_wgsl(path: str) -> str:
@@ -363,101 +366,120 @@ def main(
         usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
     )
 
+    # Total frame count for progress bar (None if stream lacks duration metadata)
+    estimated_frames = max_frames or stream.frames or None
+
     frame_index = 0
-    for frame in container.decode(stream):
-        if max_frames is not None and frame_index >= max_frames:
-            break
+    with Progress(
+        TextColumn("[bold blue]Processing"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("frames"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("frames", total=estimated_frames)
 
-        rgba = frame.to_ndarray(format="rgba")
+        for frame in container.decode(stream):
+            if max_frames is not None and frame_index >= max_frames:
+                break
 
-        device.queue.write_texture(
-            {"texture": input_texture, "mip_level": 0, "origin": (0, 0, 0)},
-            rgba.tobytes(),
-            {"bytes_per_row": unpadded_bytes_per_row, "rows_per_image": frame_height},
-            (frame_width, frame_height, 1),
-        )
+            rgba = frame.to_ndarray(format="rgba")
 
-        command_encoder = device.create_command_encoder()
-        workgroup_count_x = (frame_width + 15) // 16
-        workgroup_count_y = (frame_height + 15) // 16
-
-        keying_pass = command_encoder.begin_compute_pass()
-        keying_pass.set_pipeline(keying_pipeline)
-        keying_pass.set_bind_group(0, keying_bind_group, [], 0, 999999)
-        keying_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
-        keying_pass.end()
-
-        if blur_radius > 0:
-            horizontal_pass = command_encoder.begin_compute_pass()
-            horizontal_pass.set_pipeline(horizontal_blur_pipeline)
-            horizontal_pass.set_bind_group(0, horizontal_blur_bind_group, [], 0, 999999)
-            horizontal_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
-            horizontal_pass.end()
-
-            vertical_pass = command_encoder.begin_compute_pass()
-            vertical_pass.set_pipeline(vertical_blur_pipeline)
-            vertical_pass.set_bind_group(0, vertical_blur_bind_group, [], 0, 999999)
-            vertical_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
-            vertical_pass.end()
-
-        if total_morph_iters > 0:
-            for pipeline, bind_group in morphology_schedule:
-                morphology_pass = command_encoder.begin_compute_pass()
-                morphology_pass.set_pipeline(pipeline)
-                morphology_pass.set_bind_group(0, bind_group, [], 0, 999999)
-                morphology_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
-                morphology_pass.end()
-
-            # Morph result lands in whichever ping/pong texture was last written;
-            # copy it to output_texture so readback always reads the same buffer
-            command_encoder.copy_texture_to_texture(
-                {
-                    "texture": morphology_result_texture,
-                    "mip_level": 0,
-                    "origin": (0, 0, 0),
-                },
-                {"texture": output_texture, "mip_level": 0, "origin": (0, 0, 0)},
+            device.queue.write_texture(
+                {"texture": input_texture, "mip_level": 0, "origin": (0, 0, 0)},
+                rgba.tobytes(),
+                {"bytes_per_row": unpadded_bytes_per_row, "rows_per_image": frame_height},
                 (frame_width, frame_height, 1),
             )
 
-        command_encoder.copy_texture_to_buffer(
-            {"texture": output_texture, "mip_level": 0, "origin": (0, 0, 0)},
-            {
-                "buffer": readback_buffer,
-                "offset": 0,
-                "bytes_per_row": padded_bytes_per_row,
-                "rows_per_image": frame_height,
-            },
-            (frame_width, frame_height, 1),
-        )
+            command_encoder = device.create_command_encoder()
+            workgroup_count_x = (frame_width + 15) // 16
+            workgroup_count_y = (frame_height + 15) // 16
 
-        device.queue.submit([command_encoder.finish()])
+            keying_pass = command_encoder.begin_compute_pass()
+            keying_pass.set_pipeline(keying_pipeline)
+            keying_pass.set_bind_group(0, keying_bind_group, [], 0, 999999)
+            keying_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+            keying_pass.end()
 
-        readback_buffer.map_sync(mode=wgpu.MapMode.READ)
-        data = readback_buffer.read_mapped()
-        raw = np.frombuffer(data, dtype=np.uint8).reshape((frame_height, padded_bytes_per_row))
-        rgba_out = raw[:, :unpadded_bytes_per_row].reshape((frame_height, frame_width, 4)).copy()
-        readback_buffer.unmap()
+            if blur_radius > 0:
+                horizontal_pass = command_encoder.begin_compute_pass()
+                horizontal_pass.set_pipeline(horizontal_blur_pipeline)
+                horizontal_pass.set_bind_group(0, horizontal_blur_bind_group, [], 0, 999999)
+                horizontal_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+                horizontal_pass.end()
 
-        matte = rgba_out[:, :, 0]
+                vertical_pass = command_encoder.begin_compute_pass()
+                vertical_pass.set_pipeline(vertical_blur_pipeline)
+                vertical_pass.set_bind_group(0, vertical_blur_bind_group, [], 0, 999999)
+                vertical_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+                vertical_pass.end()
 
-        image = Image.fromarray(matte, mode="L")
-        image.save(output_path / f"mask_{frame_index:06d}.png")
+            if total_morph_iters > 0:
+                for pipeline, bind_group in morphology_schedule:
+                    morphology_pass = command_encoder.begin_compute_pass()
+                    morphology_pass.set_pipeline(pipeline)
+                    morphology_pass.set_bind_group(0, bind_group, [], 0, 999999)
+                    morphology_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+                    morphology_pass.end()
 
-        frame_index += 1
-        if frame_index % 30 == 0:
-            print(f"Saved {frame_index} frames...")
+                # Morph result lands in whichever ping/pong texture was last written;
+                # copy it to output_texture so readback always reads the same buffer
+                command_encoder.copy_texture_to_texture(
+                    {
+                        "texture": morphology_result_texture,
+                        "mip_level": 0,
+                        "origin": (0, 0, 0),
+                    },
+                    {"texture": output_texture, "mip_level": 0, "origin": (0, 0, 0)},
+                    (frame_width, frame_height, 1),
+                )
+
+            command_encoder.copy_texture_to_buffer(
+                {"texture": output_texture, "mip_level": 0, "origin": (0, 0, 0)},
+                {
+                    "buffer": readback_buffer,
+                    "offset": 0,
+                    "bytes_per_row": padded_bytes_per_row,
+                    "rows_per_image": frame_height,
+                },
+                (frame_width, frame_height, 1),
+            )
+
+            device.queue.submit([command_encoder.finish()])
+
+            readback_buffer.map_sync(mode=wgpu.MapMode.READ)
+            data = readback_buffer.read_mapped()
+            raw = np.frombuffer(data, dtype=np.uint8).reshape((frame_height, padded_bytes_per_row))
+            rgba_out = (
+                raw[:, :unpadded_bytes_per_row].reshape((frame_height, frame_width, 4)).copy()
+            )
+            readback_buffer.unmap()
+
+            matte = rgba_out[:, :, 0]
+
+            image = Image.fromarray(matte, mode="L")
+            image.save(output_path / f"mask_{frame_index:06d}.png")
+
+            frame_index += 1
+            progress.advance(task)
 
     container.close()
-    print(f"Done. Saved {frame_index} PNG masks to {output_path}")
+    log.info("Saved %d PNG masks to %s", frame_index, output_path)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input_video")
-    parser.add_argument("--out", default="alpha_hint_frames")
+    from rich_argparse import RichHelpFormatter
+
+    parser = argparse.ArgumentParser(
+        description="GPU-accelerated green-screen keying via WebGPU compute shaders.",
+        formatter_class=RichHelpFormatter,
+    )
+    parser.add_argument("input_video", help="Input video file path")
+    parser.add_argument("--out", default="alpha_hint_frames", help="Output directory for masks")
     parser.add_argument("--key_r", type=float, default=0.0, help="Key color red (0..1)")
     parser.add_argument("--key_g", type=float, default=1.0, help="Key color green (0..1)")
     parser.add_argument("--key_b", type=float, default=0.0, help="Key color blue (0..1)")

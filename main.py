@@ -12,6 +12,9 @@ def load_wgsl(path: str) -> str:
         return f.read()
 
 
+MAX_BLUR_RADIUS = 8
+
+
 def main(
     input_video: str,
     out_dir: str = "alpha_hint_frames",
@@ -19,7 +22,10 @@ def main(
     t_high: float = 0.10,
     gamma: float = 1.0,
     max_frames: int | None = None,
+    blur_radius: int = 0,
 ):
+    blur_radius = min(max(blur_radius, 0), MAX_BLUR_RADIUS)
+
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -43,8 +49,7 @@ def main(
         raise RuntimeError("No WebGPU adapter found.")
     device = adapter.request_device_sync()
 
-    shader_code = load_wgsl("alpha_hint.wgsl")
-    shader = device.create_shader_module(code=shader_code)
+    key_shader = device.create_shader_module(code=load_wgsl("alpha_hint.wgsl"))
 
     # Input texture: rgba8unorm (we upload uint8 RGBA)
     input_tex = device.create_texture(
@@ -55,7 +60,7 @@ def main(
     )
     input_view = input_tex.create_view()
 
-    # Output texture: rgba8unorm (shader writes grayscale into RGB)
+    # Output texture: final result, always needed for readback
     output_tex = device.create_texture(
         size=(width, height, 1),
         dimension=wgpu.TextureDimension.d2,
@@ -64,15 +69,15 @@ def main(
     )
     output_view = output_tex.create_view()
 
-    # Uniform params buffer (std140-ish layout handled by wgpu)
-    # We'll pack 4 floats to match Params struct.
+    # Keying params uniform
     params_data = np.array([t_low, t_high, gamma, 0.0], dtype=np.float32)
     params_buf = device.create_buffer_with_data(
         data=params_data.tobytes(),
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
 
-    bind_group_layout = device.create_bind_group_layout(
+    # --- Key pass bind group layout (shared pattern: tex_2d + storage_tex + uniform) ---
+    key_bgl = device.create_bind_group_layout(
         entries=[
             {
                 "binding": 0,
@@ -96,21 +101,128 @@ def main(
         ]
     )
 
-    pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[bind_group_layout])
+    key_pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[key_bgl])
 
-    compute_pipeline = device.create_compute_pipeline(
-        layout=pipeline_layout,
-        compute={"module": shader, "entry_point": "main"},
+    # If blur enabled, key writes to intermediate; else directly to output
+    if blur_radius > 0:
+        # Intermediate texture: keying result, read by blur_h
+        intermediate_tex = device.create_texture(
+            size=(width, height, 1),
+            dimension=wgpu.TextureDimension.d2,
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
+        )
+        intermediate_view = intermediate_tex.create_view()
+
+        # Temp texture for between blur_h and blur_v
+        blur_temp_tex = device.create_texture(
+            size=(width, height, 1),
+            dimension=wgpu.TextureDimension.d2,
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
+        )
+        blur_temp_view = blur_temp_tex.create_view()
+
+        key_dest_view = intermediate_view
+    else:
+        key_dest_view = output_view
+
+    key_pipeline = device.create_compute_pipeline(
+        layout=key_pipeline_layout,
+        compute={"module": key_shader, "entry_point": "main"},
     )
 
-    bind_group = device.create_bind_group(
-        layout=bind_group_layout,
+    key_bind_group = device.create_bind_group(
+        layout=key_bgl,
         entries=[
             {"binding": 0, "resource": input_view},
-            {"binding": 1, "resource": output_view},
+            {"binding": 1, "resource": key_dest_view},
             {"binding": 2, "resource": {"buffer": params_buf, "offset": 0, "size": 16}},
         ],
     )
+
+    # --- Blur passes (only if blur_radius > 0) ---
+    if blur_radius > 0:
+        blur_shader = device.create_shader_module(code=load_wgsl("blur.wgsl"))
+
+        blur_params_data = np.array(
+            [blur_radius, 0, 0, 0], dtype=np.int32
+        )
+        blur_params_buf = device.create_buffer_with_data(
+            data=blur_params_data.tobytes(),
+            usage=wgpu.BufferUsage.UNIFORM,
+        )
+
+        blur_bgl = device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "texture": {"sample_type": wgpu.TextureSampleType.float},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "storage_texture": {
+                        "access": wgpu.StorageTextureAccess.write_only,
+                        "format": wgpu.TextureFormat.rgba8unorm,
+                        "view_dimension": wgpu.TextureViewDimension.d2,
+                    },
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": wgpu.BufferBindingType.uniform},
+                },
+            ]
+        )
+
+        blur_pipeline_layout = device.create_pipeline_layout(
+            bind_group_layouts=[blur_bgl]
+        )
+
+        blur_h_pipeline = device.create_compute_pipeline(
+            layout=blur_pipeline_layout,
+            compute={"module": blur_shader, "entry_point": "blur_h"},
+        )
+        blur_v_pipeline = device.create_compute_pipeline(
+            layout=blur_pipeline_layout,
+            compute={"module": blur_shader, "entry_point": "blur_v"},
+        )
+
+        # blur_h: intermediate → blur_temp
+        blur_h_bind_group = device.create_bind_group(
+            layout=blur_bgl,
+            entries=[
+                {"binding": 0, "resource": intermediate_view},
+                {"binding": 1, "resource": blur_temp_view},
+                {
+                    "binding": 2,
+                    "resource": {
+                        "buffer": blur_params_buf,
+                        "offset": 0,
+                        "size": 16,
+                    },
+                },
+            ],
+        )
+
+        # blur_v: blur_temp → output
+        blur_v_bind_group = device.create_bind_group(
+            layout=blur_bgl,
+            entries=[
+                {"binding": 0, "resource": blur_temp_view},
+                {"binding": 1, "resource": output_view},
+                {
+                    "binding": 2,
+                    "resource": {
+                        "buffer": blur_params_buf,
+                        "offset": 0,
+                        "size": 16,
+                    },
+                },
+            ],
+        )
 
     # Readback buffer (RGBA8)
     bytes_per_pixel = 4
@@ -142,16 +254,31 @@ def main(
             (width, height, 1),
         )
 
-        # Encode compute pass + copy output texture -> readback buffer
+        # Encode compute passes + copy output texture -> readback buffer
         command_encoder = device.create_command_encoder()
-
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(compute_pipeline)
-        compute_pass.set_bind_group(0, bind_group, [], 0, 999999)
         gx = (width + 15) // 16
         gy = (height + 15) // 16
-        compute_pass.dispatch_workgroups(gx, gy, 1)
-        compute_pass.end()
+
+        # Pass 1: keying
+        key_pass = command_encoder.begin_compute_pass()
+        key_pass.set_pipeline(key_pipeline)
+        key_pass.set_bind_group(0, key_bind_group, [], 0, 999999)
+        key_pass.dispatch_workgroups(gx, gy, 1)
+        key_pass.end()
+
+        # Pass 2+3: separable blur (if enabled)
+        if blur_radius > 0:
+            h_pass = command_encoder.begin_compute_pass()
+            h_pass.set_pipeline(blur_h_pipeline)
+            h_pass.set_bind_group(0, blur_h_bind_group, [], 0, 999999)
+            h_pass.dispatch_workgroups(gx, gy, 1)
+            h_pass.end()
+
+            v_pass = command_encoder.begin_compute_pass()
+            v_pass.set_pipeline(blur_v_pipeline)
+            v_pass.set_bind_group(0, blur_v_bind_group, [], 0, 999999)
+            v_pass.dispatch_workgroups(gx, gy, 1)
+            v_pass.end()
 
         command_encoder.copy_texture_to_buffer(
             {"texture": output_tex, "mip_level": 0, "origin": (0, 0, 0)},
@@ -198,6 +325,10 @@ if __name__ == "__main__":
     p.add_argument("--t_high", type=float, default=0.10)
     p.add_argument("--gamma", type=float, default=1.0)
     p.add_argument("--max_frames", type=int, default=None)
+    p.add_argument(
+        "--blur_radius", type=int, default=0,
+        help="Separable box blur radius (0=off, max 8)",
+    )
     args = p.parse_args()
 
     main(
@@ -207,4 +338,5 @@ if __name__ == "__main__":
         t_high=args.t_high,
         gamma=args.gamma,
         max_frames=args.max_frames,
+        blur_radius=args.blur_radius,
     )

@@ -421,12 +421,11 @@ wheels = [
 [[package]]
 name = "webgpu-alpha-hint"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "av" },
     { name = "numpy" },
     { name = "pillow" },
-    { name = "pytest" },
     { name = "rich" },
     { name = "rich-argparse" },
     { name = "wgpu" },
@@ -434,6 +433,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pytest" },
     { name = "ruff" },
     { name = "ty" },
 ]
@@ -443,7 +443,6 @@ requires-dist = [
     { name = "av", specifier = ">=16.1.0" },
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "pillow", specifier = ">=12.1.1" },
-    { name = "pytest", specifier = ">=9.0.2" },
     { name = "rich", specifier = ">=14.3.3" },
     { name = "rich-argparse", specifier = ">=1.7.2" },
     { name = "wgpu", specifier = ">=0.31.0" },
@@ -451,6 +450,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "pytest", specifier = ">=9.0.2" },
     { name = "ruff", specifier = ">=0.15.4" },
     { name = "ty", specifier = ">=0.0.20" },
 ]

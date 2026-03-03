@@ -1,7 +1,6 @@
 """GPU shader tests — keying, blur, and morphology on synthetic pixels."""
 
 import numpy as np
-
 from conftest import (
     make_key_params,
     run_blur_pass,

@@ -2,10 +2,26 @@
 
 GPU-accelerated green-screen keying via WebGPU compute shaders.
 
-## Usage
+## Install
 
 ```bash
-python main.py input.mp4 --out masks/ --softness 0.3 --blur_radius 3 --erode_iters 1 --dilate_iters 1 --max_frames 10
+pip install -e .
+```
+
+## Usage
+
+### CLI
+
+```bash
+webgpu-alpha-hint input.mp4 --out masks/ --softness 0.3 --blur_radius 3 --erode_iters 1 --dilate_iters 1 --max_frames 10
+```
+
+### Python
+
+```python
+from webgpu_alpha_hint import process_video
+
+process_video("input.mp4", out_dir="masks/", softness=0.3, blur_radius=3)
 ```
 
 ## CLI flags
@@ -33,24 +49,20 @@ via a smoothstep transition controlled by `--softness`.
 A **saturation gate** protects low-saturation pixels (grey, white, black) from being keyed,
 even if their chromaticity happens to land near the key color.
 
-## CLI output
-
-Terminal output uses [Rich](https://github.com/Textualize/rich) for styled help (`rich-argparse`), inline progress bars during frame processing, and formatted tracebacks. The shared console lives in `console.py`.
-
 ## Architecture
 
-Single-file pipeline (`main.py`) with three WGSL compute shaders (`alpha_hint.wgsl`, `blur.wgsl`, `morphology.wgsl`). All textures are `rgba8unorm`.
+`src/webgpu_alpha_hint/` package with three WGSL compute shaders (`shaders/alpha_hint.wgsl`, `shaders/blur.wgsl`, `shaders/morphology.wgsl`). All textures are `rgba8unorm`.
 
 ### GPU data flow
 
 Which texture each stage writes to changes depending on which passes are enabled:
 
-- **Key only**: key → `output_tex`
-- **Key + blur**: key → `intermediate_tex` → blur_h → `blur_temp_tex` → blur_v → `output_tex`
-- **Key + morph**: key → `morph_ping` → ping-pong erode/dilate → copy final → `output_tex`
+- **Key only**: key -> `output_tex`
+- **Key + blur**: key -> `intermediate_tex` -> blur_h -> `blur_temp_tex` -> blur_v -> `output_tex`
+- **Key + morph**: key -> `morph_ping` -> ping-pong erode/dilate -> copy final -> `output_tex`
 - **Key + blur + morph**: blur_v writes to `morph_ping` instead of `output_tex`, then morph ping-pongs, then copies to `output_tex`
 
-Morphology ping-pongs between `morph_ping` ↔ `morph_pong`. `reading_ping` bool tracks which texture holds current data.
+Morphology ping-pongs between `morph_ping` and `morph_pong`. `reading_ping` bool tracks which texture holds current data.
 
 Key color is pre-normalized on CPU before upload (avoids per-pixel division in shader). Matte stored in R channel only; readback extracts `rgba_out[:, :, 0]`.
 

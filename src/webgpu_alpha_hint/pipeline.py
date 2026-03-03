@@ -1,3 +1,5 @@
+"""Main GPU keying pipeline: video in, per-frame alpha masks out."""
+
 from pathlib import Path
 
 import av
@@ -7,21 +9,11 @@ import wgpu.utils
 from PIL import Image
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 
-from console import console, log
+from .console import console, log
+from .shader_utils import BYTES_PER_PIXEL, BYTES_PER_ROW_ALIGNMENT, MAX_BLUR_RADIUS, load_wgsl
 
 
-def load_wgsl(path: str) -> str:
-    """Load a WGSL shader source file."""
-    with open(path, encoding="utf-8") as f:
-        return f.read()
-
-
-MAX_BLUR_RADIUS = 8
-BYTES_PER_PIXEL = 4
-BYTES_PER_ROW_ALIGNMENT = 256
-
-
-def main(
+def process_video(
     input_video: str,
     out_dir: str = "alpha_hint_frames",
     key_r: float = 0.0,
@@ -66,7 +58,7 @@ def main(
         raise RuntimeError("No WebGPU adapter found.")
     device = adapter.request_device_sync()
 
-    keying_shader = device.create_shader_module(code=load_wgsl("alpha_hint.wgsl"))
+    keying_shader = device.create_shader_module(code=load_wgsl("alpha_hint"))
 
     input_texture = device.create_texture(
         size=(frame_width, frame_height, 1),
@@ -205,7 +197,7 @@ def main(
     )
 
     if blur_radius > 0:
-        blur_shader = device.create_shader_module(code=load_wgsl("blur.wgsl"))
+        blur_shader = device.create_shader_module(code=load_wgsl("blur"))
 
         blur_params_data = np.array([blur_radius, 0, 0, 0], dtype=np.int32)
         blur_params_buffer = device.create_buffer_with_data(
@@ -283,7 +275,7 @@ def main(
         )
 
     if total_morph_iters > 0:
-        morphology_shader = device.create_shader_module(code=load_wgsl("morphology.wgsl"))
+        morphology_shader = device.create_shader_module(code=load_wgsl("morphology"))
 
         morphology_bind_group_layout = device.create_bind_group_layout(
             entries=[
@@ -467,67 +459,3 @@ def main(
 
     container.close()
     log.info("Saved %d PNG masks to %s", frame_index, output_path)
-
-
-if __name__ == "__main__":
-    import argparse
-
-    from rich_argparse import RichHelpFormatter
-
-    parser = argparse.ArgumentParser(
-        description="GPU-accelerated green-screen keying via WebGPU compute shaders.",
-        formatter_class=RichHelpFormatter,
-    )
-    parser.add_argument("input_video", help="Input video file path")
-    parser.add_argument("--out", default="alpha_hint_frames", help="Output directory for masks")
-    parser.add_argument("--key_r", type=float, default=0.0, help="Key color red (0..1)")
-    parser.add_argument("--key_g", type=float, default=1.0, help="Key color green (0..1)")
-    parser.add_argument("--key_b", type=float, default=0.0, help="Key color blue (0..1)")
-    parser.add_argument(
-        "--softness",
-        type=float,
-        default=0.3,
-        help="Chroma-distance transition width (0=hard, ~0.3=typical green screen)",
-    )
-    parser.add_argument("--gamma", type=float, default=1.0, help="Gamma bias on matte edges")
-    parser.add_argument(
-        "--sat_gate",
-        type=float,
-        default=0.1,
-        help="Saturation below which keying is suppressed (protects greys/whites)",
-    )
-    parser.add_argument("--max_frames", type=int, default=None)
-    parser.add_argument(
-        "--blur_radius",
-        type=int,
-        default=0,
-        help="Separable box blur radius (0=off, max 8)",
-    )
-    parser.add_argument(
-        "--erode_iters",
-        type=int,
-        default=0,
-        help="Erode iterations (3x3 min, removes speckle)",
-    )
-    parser.add_argument(
-        "--dilate_iters",
-        type=int,
-        default=0,
-        help="Dilate iterations (3x3 max, fills small holes)",
-    )
-    args = parser.parse_args()
-
-    main(
-        args.input_video,
-        out_dir=args.out,
-        key_r=args.key_r,
-        key_g=args.key_g,
-        key_b=args.key_b,
-        softness=args.softness,
-        gamma=args.gamma,
-        sat_gate=args.sat_gate,
-        max_frames=args.max_frames,
-        blur_radius=args.blur_radius,
-        erode_iters=args.erode_iters,
-        dilate_iters=args.dilate_iters,
-    )

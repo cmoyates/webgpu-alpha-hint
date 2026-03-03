@@ -9,7 +9,7 @@
 ## Commands
 
 ```bash
-uv run pytest test_shaders.py test_pipeline.py -v   # requires GPU adapter
+uv run pytest -v                                    # requires GPU adapter
 uv run ruff check . && uv run ruff format .
 uv run ty
 ```

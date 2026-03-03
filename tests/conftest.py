@@ -4,10 +4,8 @@ import numpy as np
 import pytest
 import wgpu
 
-WORKGROUP_SIZE = 16
-BYTES_PER_PIXEL = 4
-TEX_FORMAT = wgpu.TextureFormat.rgba8unorm
-
+from webgpu_alpha_hint.gpu import TEX_FORMAT, create_texture, readback_r_channel, upload_rgba
+from webgpu_alpha_hint.shader_utils import WORKGROUP_SIZE, load_wgsl
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -20,69 +18,6 @@ def device():
     if adapter is None:
         pytest.skip("No WebGPU adapter")
     return adapter.request_device_sync()
-
-
-# ---------------------------------------------------------------------------
-# Low-level helpers
-# ---------------------------------------------------------------------------
-
-
-def load_wgsl(path: str) -> str:
-    """Load a WGSL shader source file."""
-    with open(path, encoding="utf-8") as f:
-        return f.read()
-
-
-def create_texture(device, width, height, usage):
-    """Create a 2D rgba8unorm texture with the given usage flags."""
-    return device.create_texture(
-        size=(width, height, 1),
-        dimension=wgpu.TextureDimension.d2,
-        format=TEX_FORMAT,
-        usage=usage,
-    )
-
-
-def upload_rgba(device, texture, data: np.ndarray):
-    """Upload uint8 RGBA array (H, W, 4) to texture."""
-    frame_height, frame_width, _ = data.shape
-    bytes_per_row = frame_width * BYTES_PER_PIXEL
-    device.queue.write_texture(
-        {"texture": texture, "mip_level": 0, "origin": (0, 0, 0)},
-        data.tobytes(),
-        {"bytes_per_row": bytes_per_row, "rows_per_image": frame_height},
-        (frame_width, frame_height, 1),
-    )
-
-
-def readback_r_channel(device, texture, width, height) -> np.ndarray:
-    """Read back R channel as float array (H, W) in [0, 1]."""
-    bytes_per_row = width * BYTES_PER_PIXEL
-    # WebGPU spec requires bytes_per_row aligned to 256
-    padded_bytes_per_row = ((bytes_per_row + 255) // 256) * 256
-    readback_buffer = device.create_buffer(
-        size=padded_bytes_per_row * height,
-        usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
-    )
-    command_encoder = device.create_command_encoder()
-    command_encoder.copy_texture_to_buffer(
-        {"texture": texture, "mip_level": 0, "origin": (0, 0, 0)},
-        {
-            "buffer": readback_buffer,
-            "offset": 0,
-            "bytes_per_row": padded_bytes_per_row,
-            "rows_per_image": height,
-        },
-        (width, height, 1),
-    )
-    device.queue.submit([command_encoder.finish()])
-    readback_buffer.map_sync(mode=wgpu.MapMode.READ)
-    raw = np.frombuffer(readback_buffer.read_mapped(), dtype=np.uint8).reshape(
-        (height, padded_bytes_per_row)
-    )
-    rgba = raw[:, :bytes_per_row].reshape((height, width, 4)).copy()
-    readback_buffer.unmap()
-    return rgba[:, :, 0].astype(np.float32) / 255.0
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +86,7 @@ def run_key_pass(device, input_rgba: np.ndarray, params: np.ndarray) -> np.ndarr
         data=params.tobytes(), usage=wgpu.BufferUsage.UNIFORM
     )
 
-    shader = device.create_shader_module(code=load_wgsl("alpha_hint.wgsl"))
+    shader = device.create_shader_module(code=load_wgsl("alpha_hint"))
     bind_group_layout = device.create_bind_group_layout(
         entries=[
             {
@@ -195,7 +130,11 @@ def run_key_pass(device, input_rgba: np.ndarray, params: np.ndarray) -> np.ndarr
     compute_pass = command_encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group, [], 0, 999999)
-    compute_pass.dispatch_workgroups((frame_width + 15) // 16, (frame_height + 15) // 16, 1)
+    compute_pass.dispatch_workgroups(
+        (frame_width + WORKGROUP_SIZE - 1) // WORKGROUP_SIZE,
+        (frame_height + WORKGROUP_SIZE - 1) // WORKGROUP_SIZE,
+        1,
+    )
     compute_pass.end()
     device.queue.submit([command_encoder.finish()])
 
@@ -235,7 +174,7 @@ def run_blur_pass(device, input_rgba: np.ndarray, radius: int) -> np.ndarray:
     blur_params_buffer = device.create_buffer_with_data(
         data=blur_params.tobytes(), usage=wgpu.BufferUsage.UNIFORM
     )
-    shader = device.create_shader_module(code=load_wgsl("blur.wgsl"))
+    shader = device.create_shader_module(code=load_wgsl("blur"))
     bind_group_layout = device.create_bind_group_layout(
         entries=[
             {
@@ -300,8 +239,8 @@ def run_blur_pass(device, input_rgba: np.ndarray, radius: int) -> np.ndarray:
         ],
     )
 
-    workgroup_count_x = (frame_width + 15) // 16
-    workgroup_count_y = (frame_height + 15) // 16
+    workgroup_count_x = (frame_width + WORKGROUP_SIZE - 1) // WORKGROUP_SIZE
+    workgroup_count_y = (frame_height + WORKGROUP_SIZE - 1) // WORKGROUP_SIZE
     command_encoder = device.create_command_encoder()
     horizontal_pass = command_encoder.begin_compute_pass()
     horizontal_pass.set_pipeline(horizontal_blur_pipeline)
@@ -341,7 +280,7 @@ def run_morph_pass(device, input_rgba: np.ndarray, entry_point: str) -> np.ndarr
     )
     upload_rgba(device, input_texture, input_rgba)
 
-    shader = device.create_shader_module(code=load_wgsl("morphology.wgsl"))
+    shader = device.create_shader_module(code=load_wgsl("morphology"))
     bind_group_layout = device.create_bind_group_layout(
         entries=[
             {
@@ -376,7 +315,11 @@ def run_morph_pass(device, input_rgba: np.ndarray, entry_point: str) -> np.ndarr
     compute_pass = command_encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group, [], 0, 999999)
-    compute_pass.dispatch_workgroups((frame_width + 15) // 16, (frame_height + 15) // 16, 1)
+    compute_pass.dispatch_workgroups(
+        (frame_width + WORKGROUP_SIZE - 1) // WORKGROUP_SIZE,
+        (frame_height + WORKGROUP_SIZE - 1) // WORKGROUP_SIZE,
+        1,
+    )
     compute_pass.end()
     device.queue.submit([command_encoder.finish()])
 

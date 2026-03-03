@@ -1,7 +1,6 @@
 """Pipeline combo tests — compose shader helpers sequentially."""
 
 import numpy as np
-
 from conftest import (
     make_key_params,
     matte_to_rgba,

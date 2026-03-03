@@ -11,3 +11,8 @@ wheels/
 
 input/
 output/
+
+.DS_Store
+
+.ruff_cache/
+.pytest_cache/

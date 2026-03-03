@@ -2,7 +2,8 @@
 
 ## Important
 
-Be extremely concise in all interactions and commit messages. Sacrifice grammar for the sake of being concise.
+- Be extremely concise in all interactions and commit messages. Sacrifice grammar for the sake of being concise.
+- Always use descriptive names for variables, functions and classes
 
 ## Commands
 

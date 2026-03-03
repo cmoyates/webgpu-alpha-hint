@@ -1,4 +1,4 @@
-# webgpu-alpha-hint
+# WebGPU Alpha Hint
 
 GPU-accelerated green-screen keying via WebGPU compute shaders.
 
@@ -8,12 +8,31 @@ GPU-accelerated green-screen keying via WebGPU compute shaders.
 pip install -e .
 ```
 
+For development (includes pytest, ruff, ty):
+
+```bash
+pip install -e . --group dev
+```
+
 ## Usage
 
 ### CLI
 
 ```bash
-webgpu-alpha-hint input.mp4 --out masks/ --softness 0.3 --blur_radius 3 --erode_iters 1 --dilate_iters 1 --max_frames 10
+# Basic usage — outputs masks to output/ by default
+webgpu-alpha-hint input.mp4
+
+# Custom output directory
+webgpu-alpha-hint input.mp4 --out masks/
+
+# Green screen with blur + morphology cleanup
+webgpu-alpha-hint input.mp4 --softness 0.3 --blur_radius 3 --erode_iters 1 --dilate_iters 1
+
+# Blue screen keying, first 100 frames only
+webgpu-alpha-hint input.mp4 --key_r 0 --key_g 0 --key_b 1 --max_frames 100
+
+# View all options
+webgpu-alpha-hint --help
 ```
 
 ### Python
@@ -21,14 +40,33 @@ webgpu-alpha-hint input.mp4 --out masks/ --softness 0.3 --blur_radius 3 --erode_
 ```python
 from webgpu_alpha_hint import process_video
 
-process_video("input.mp4", out_dir="masks/", softness=0.3, blur_radius=3)
+# Minimal — uses default green key and saves to output/
+process_video("input.mp4")
+
+# Full control
+process_video(
+    "input.mp4",
+    out_dir="masks/",
+    softness=0.3,
+    blur_radius=3,
+    erode_iters=1,
+    dilate_iters=1,
+)
+```
+
+Individual utilities are also importable:
+
+```python
+from webgpu_alpha_hint.shader_utils import load_wgsl
+from webgpu_alpha_hint.gpu import create_texture, upload_rgba, readback_r_channel
+from webgpu_alpha_hint.console import console, log
 ```
 
 ## CLI flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--out` | `alpha_hint_frames` | Output directory for mask PNGs |
+| `--out` | `output` | Output directory for mask PNGs |
 | `--key_r` | `0.0` | Key color red channel (0..1) |
 | `--key_g` | `1.0` | Key color green channel (0..1) |
 | `--key_b` | `0.0` | Key color blue channel (0..1) |

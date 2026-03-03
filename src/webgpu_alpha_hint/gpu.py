@@ -52,9 +52,7 @@ def readback_r_channel(device, texture, width: int, height: int) -> np.ndarray:
     )
     device.queue.submit([command_encoder.finish()])
     readback_buffer.map_sync(mode=wgpu.MapMode.READ)
-    raw = np.frombuffer(readback_buffer.read_mapped(), dtype=np.uint8).reshape(
-        (height, padded_bytes_per_row)
-    )
+    raw = np.frombuffer(readback_buffer.read_mapped(), dtype=np.uint8).reshape((height, padded_bytes_per_row))
     rgba = raw[:, :bytes_per_row].reshape((height, width, 4)).copy()
     readback_buffer.unmap()
     return rgba[:, :, 0].astype(np.float32) / 255.0

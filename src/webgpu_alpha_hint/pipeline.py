@@ -72,9 +72,7 @@ def process_video(
         size=(frame_width, frame_height, 1),
         dimension=wgpu.TextureDimension.d2,
         format=wgpu.TextureFormat.rgba8unorm,
-        usage=wgpu.TextureUsage.STORAGE_BINDING
-        | wgpu.TextureUsage.COPY_SRC
-        | wgpu.TextureUsage.COPY_DST,
+        usage=wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.COPY_SRC | wgpu.TextureUsage.COPY_DST,
     )
     output_texture_view = output_texture.create_view()
 
@@ -118,9 +116,7 @@ def process_video(
         ]
     )
 
-    keying_pipeline_layout = device.create_pipeline_layout(
-        bind_group_layouts=[keying_bind_group_layout]
-    )
+    keying_pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[keying_bind_group_layout])
 
     # Texture routing: each stage writes to the next stage's input.
     # The last active stage writes to output_texture for readback.
@@ -148,9 +144,7 @@ def process_video(
     # Morphology needs two textures to alternate reads/writes between iterations
     if total_morph_iters > 0:
         morphology_texture_usage = (
-            wgpu.TextureUsage.STORAGE_BINDING
-            | wgpu.TextureUsage.TEXTURE_BINDING
-            | wgpu.TextureUsage.COPY_SRC
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC
         )
         morph_ping_texture = device.create_texture(
             size=(frame_width, frame_height, 1),
@@ -229,9 +223,7 @@ def process_video(
             ]
         )
 
-        blur_pipeline_layout = device.create_pipeline_layout(
-            bind_group_layouts=[blur_bind_group_layout]
-        )
+        blur_pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[blur_bind_group_layout])
 
         horizontal_blur_pipeline = device.create_compute_pipeline(
             layout=blur_pipeline_layout,
@@ -295,9 +287,7 @@ def process_video(
                 },
             ]
         )
-        morphology_pipeline_layout = device.create_pipeline_layout(
-            bind_group_layouts=[morphology_bind_group_layout]
-        )
+        morphology_pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[morphology_bind_group_layout])
 
         erode_pipeline = device.create_compute_pipeline(
             layout=morphology_pipeline_layout,
@@ -328,15 +318,11 @@ def process_video(
         morphology_schedule = []
         reading_ping = True
         for _ in range(erode_iters):
-            bind_group = (
-                morph_bind_group_ping_to_pong if reading_ping else morph_bind_group_pong_to_ping
-            )
+            bind_group = morph_bind_group_ping_to_pong if reading_ping else morph_bind_group_pong_to_ping
             morphology_schedule.append((erode_pipeline, bind_group))
             reading_ping = not reading_ping
         for _ in range(dilate_iters):
-            bind_group = (
-                morph_bind_group_ping_to_pong if reading_ping else morph_bind_group_pong_to_ping
-            )
+            bind_group = morph_bind_group_ping_to_pong if reading_ping else morph_bind_group_pong_to_ping
             morphology_schedule.append((dilate_pipeline, bind_group))
             reading_ping = not reading_ping
 
@@ -347,9 +333,7 @@ def process_video(
 
     # WebGPU spec requires bytes_per_row aligned to 256
     padded_bytes_per_row = (
-        (unpadded_bytes_per_row + BYTES_PER_ROW_ALIGNMENT - 1)
-        // BYTES_PER_ROW_ALIGNMENT
-        * BYTES_PER_ROW_ALIGNMENT
+        (unpadded_bytes_per_row + BYTES_PER_ROW_ALIGNMENT - 1) // BYTES_PER_ROW_ALIGNMENT * BYTES_PER_ROW_ALIGNMENT
     )
     readback_size = padded_bytes_per_row * frame_height
 
@@ -444,9 +428,7 @@ def process_video(
             readback_buffer.map_sync(mode=wgpu.MapMode.READ)
             data = readback_buffer.read_mapped()
             raw = np.frombuffer(data, dtype=np.uint8).reshape((frame_height, padded_bytes_per_row))
-            rgba_out = (
-                raw[:, :unpadded_bytes_per_row].reshape((frame_height, frame_width, 4)).copy()
-            )
+            rgba_out = raw[:, :unpadded_bytes_per_row].reshape((frame_height, frame_width, 4)).copy()
             readback_buffer.unmap()
 
             matte = rgba_out[:, :, 0]

@@ -82,9 +82,7 @@ def run_key_pass(device, input_rgba: np.ndarray, params: np.ndarray) -> np.ndarr
     )
     upload_rgba(device, input_texture, input_rgba)
 
-    params_buffer = device.create_buffer_with_data(
-        data=params.tobytes(), usage=wgpu.BufferUsage.UNIFORM
-    )
+    params_buffer = device.create_buffer_with_data(data=params.tobytes(), usage=wgpu.BufferUsage.UNIFORM)
 
     shader = device.create_shader_module(code=load_wgsl("alpha_hint"))
     bind_group_layout = device.create_bind_group_layout(
@@ -171,9 +169,7 @@ def run_blur_pass(device, input_rgba: np.ndarray, radius: int) -> np.ndarray:
     upload_rgba(device, input_texture, input_rgba)
 
     blur_params = np.array([radius, 0, 0, 0], dtype=np.int32)
-    blur_params_buffer = device.create_buffer_with_data(
-        data=blur_params.tobytes(), usage=wgpu.BufferUsage.UNIFORM
-    )
+    blur_params_buffer = device.create_buffer_with_data(data=blur_params.tobytes(), usage=wgpu.BufferUsage.UNIFORM)
     shader = device.create_shader_module(code=load_wgsl("blur"))
     bind_group_layout = device.create_bind_group_layout(
         entries=[

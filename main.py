@@ -23,8 +23,13 @@ def main(
     gamma: float = 1.0,
     max_frames: int | None = None,
     blur_radius: int = 0,
+    erode_iters: int = 0,
+    dilate_iters: int = 0,
 ):
     blur_radius = min(max(blur_radius, 0), MAX_BLUR_RADIUS)
+    erode_iters = max(erode_iters, 0)
+    dilate_iters = max(dilate_iters, 0)
+    total_morph_iters = erode_iters + dilate_iters
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -65,7 +70,9 @@ def main(
         size=(width, height, 1),
         dimension=wgpu.TextureDimension.d2,
         format=wgpu.TextureFormat.rgba8unorm,
-        usage=wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.COPY_SRC,
+        usage=wgpu.TextureUsage.STORAGE_BINDING
+        | wgpu.TextureUsage.COPY_SRC
+        | wgpu.TextureUsage.COPY_DST,
     )
     output_view = output_tex.create_view()
 
@@ -103,7 +110,11 @@ def main(
 
     key_pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[key_bgl])
 
-    # If blur enabled, key writes to intermediate; else directly to output
+    # Determine where keying and blur write their result.
+    # If morphology follows, the pre-morph stage writes to morph_ping.
+    # Otherwise, if blur follows keying, key writes to intermediate.
+    # Otherwise, key writes directly to output.
+
     if blur_radius > 0:
         # Intermediate texture: keying result, read by blur_h
         intermediate_tex = device.create_texture(
@@ -126,6 +137,37 @@ def main(
         key_dest_view = intermediate_view
     else:
         key_dest_view = output_view
+
+    # --- Morphology ping-pong textures ---
+    if total_morph_iters > 0:
+        morph_tex_usage = (
+            wgpu.TextureUsage.STORAGE_BINDING
+            | wgpu.TextureUsage.TEXTURE_BINDING
+            | wgpu.TextureUsage.COPY_SRC
+        )
+        morph_ping_tex = device.create_texture(
+            size=(width, height, 1),
+            dimension=wgpu.TextureDimension.d2,
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=morph_tex_usage,
+        )
+        morph_ping_view = morph_ping_tex.create_view()
+
+        morph_pong_tex = device.create_texture(
+            size=(width, height, 1),
+            dimension=wgpu.TextureDimension.d2,
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=morph_tex_usage,
+        )
+        morph_pong_view = morph_pong_tex.create_view()
+
+        # Redirect the last pre-morph stage to write to morph_ping
+        if blur_radius > 0:
+            blur_v_dest_view = morph_ping_view
+        else:
+            key_dest_view = morph_ping_view
+    else:
+        blur_v_dest_view = output_view if blur_radius > 0 else None
 
     key_pipeline = device.create_compute_pipeline(
         layout=key_pipeline_layout,
@@ -190,7 +232,6 @@ def main(
             compute={"module": blur_shader, "entry_point": "blur_v"},
         )
 
-        # blur_h: intermediate → blur_temp
         blur_h_bind_group = device.create_bind_group(
             layout=blur_bgl,
             entries=[
@@ -207,12 +248,12 @@ def main(
             ],
         )
 
-        # blur_v: blur_temp → output
+        # blur_v writes to morph_ping (if morph follows) or output
         blur_v_bind_group = device.create_bind_group(
             layout=blur_bgl,
             entries=[
                 {"binding": 0, "resource": blur_temp_view},
-                {"binding": 1, "resource": output_view},
+                {"binding": 1, "resource": blur_v_dest_view},
                 {
                     "binding": 2,
                     "resource": {
@@ -223,6 +264,74 @@ def main(
                 },
             ],
         )
+
+    # --- Morphology pipelines and bind groups ---
+    if total_morph_iters > 0:
+        morph_shader = device.create_shader_module(code=load_wgsl("morphology.wgsl"))
+
+        # Morphology uses same 2-binding layout: tex_2d read + storage_tex write
+        morph_bgl = device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "texture": {"sample_type": wgpu.TextureSampleType.float},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "storage_texture": {
+                        "access": wgpu.StorageTextureAccess.write_only,
+                        "format": wgpu.TextureFormat.rgba8unorm,
+                        "view_dimension": wgpu.TextureViewDimension.d2,
+                    },
+                },
+            ]
+        )
+        morph_pipeline_layout = device.create_pipeline_layout(
+            bind_group_layouts=[morph_bgl]
+        )
+
+        erode_pipeline = device.create_compute_pipeline(
+            layout=morph_pipeline_layout,
+            compute={"module": morph_shader, "entry_point": "erode"},
+        )
+        dilate_pipeline = device.create_compute_pipeline(
+            layout=morph_pipeline_layout,
+            compute={"module": morph_shader, "entry_point": "dilate"},
+        )
+
+        # Pre-build bind groups for ping→pong and pong→ping
+        morph_bg_ping_to_pong = device.create_bind_group(
+            layout=morph_bgl,
+            entries=[
+                {"binding": 0, "resource": morph_ping_view},
+                {"binding": 1, "resource": morph_pong_view},
+            ],
+        )
+        morph_bg_pong_to_ping = device.create_bind_group(
+            layout=morph_bgl,
+            entries=[
+                {"binding": 0, "resource": morph_pong_view},
+                {"binding": 1, "resource": morph_ping_view},
+            ],
+        )
+
+        # Build iteration schedule: list of (pipeline, bind_group) tuples
+        # Data starts in morph_ping. Iterations alternate ping→pong, pong→ping.
+        morph_schedule = []
+        reading_ping = True
+        for _ in range(erode_iters):
+            bg = morph_bg_ping_to_pong if reading_ping else morph_bg_pong_to_ping
+            morph_schedule.append((erode_pipeline, bg))
+            reading_ping = not reading_ping
+        for _ in range(dilate_iters):
+            bg = morph_bg_ping_to_pong if reading_ping else morph_bg_pong_to_ping
+            morph_schedule.append((dilate_pipeline, bg))
+            reading_ping = not reading_ping
+
+        # reading_ping tracks the *next* read source; the last write went to the other.
+        morph_result_tex = morph_ping_tex if reading_ping else morph_pong_tex
 
     # Readback buffer (RGBA8)
     bytes_per_pixel = 4
@@ -254,7 +363,6 @@ def main(
             (width, height, 1),
         )
 
-        # Encode compute passes + copy output texture -> readback buffer
         command_encoder = device.create_command_encoder()
         gx = (width + 15) // 16
         gy = (height + 15) // 16
@@ -280,6 +388,22 @@ def main(
             v_pass.dispatch_workgroups(gx, gy, 1)
             v_pass.end()
 
+        # Pass 4+: morphology iterations (if enabled)
+        if total_morph_iters > 0:
+            for pipeline, bind_group in morph_schedule:
+                m_pass = command_encoder.begin_compute_pass()
+                m_pass.set_pipeline(pipeline)
+                m_pass.set_bind_group(0, bind_group, [], 0, 999999)
+                m_pass.dispatch_workgroups(gx, gy, 1)
+                m_pass.end()
+
+            # Copy morph result → output_tex for readback
+            command_encoder.copy_texture_to_texture(
+                {"texture": morph_result_tex, "mip_level": 0, "origin": (0, 0, 0)},
+                {"texture": output_tex, "mip_level": 0, "origin": (0, 0, 0)},
+                (width, height, 1),
+            )
+
         command_encoder.copy_texture_to_buffer(
             {"texture": output_tex, "mip_level": 0, "origin": (0, 0, 0)},
             {
@@ -293,17 +417,14 @@ def main(
 
         device.queue.submit([command_encoder.finish()])
 
-        # Map buffer and extract the unpadded RGBA rows
         readback_buf.map_sync(mode=wgpu.MapMode.READ)
         data = readback_buf.read_mapped()
         raw = np.frombuffer(data, dtype=np.uint8).reshape((height, padded_bpr))
         rgba_out = raw[:, :unpadded_bpr].reshape((height, width, 4)).copy()
         readback_buf.unmap()
 
-        # Take grayscale from R channel (same as G,B)
         matte = rgba_out[:, :, 0]
 
-        # Save PNG
         img = Image.fromarray(matte, mode="L")
         img.save(out_path / f"mask_{frame_index:06d}.png")
 
@@ -329,6 +450,14 @@ if __name__ == "__main__":
         "--blur_radius", type=int, default=0,
         help="Separable box blur radius (0=off, max 8)",
     )
+    p.add_argument(
+        "--erode_iters", type=int, default=0,
+        help="Erode iterations (3x3 min, removes speckle)",
+    )
+    p.add_argument(
+        "--dilate_iters", type=int, default=0,
+        help="Dilate iterations (3x3 max, fills small holes)",
+    )
     args = p.parse_args()
 
     main(
@@ -339,4 +468,6 @@ if __name__ == "__main__":
         gamma=args.gamma,
         max_frames=args.max_frames,
         blur_radius=args.blur_radius,
+        erode_iters=args.erode_iters,
+        dilate_iters=args.dilate_iters,
     )

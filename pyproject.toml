@@ -8,6 +8,7 @@ dependencies = [
     "av>=16.1.0",
     "numpy>=2.4.2",
     "pillow>=12.1.1",
+    "pytest>=9.0.2",
     "wgpu>=0.31.0",
 ]
 

@@ -5,7 +5,7 @@ GPU-accelerated green-screen keying via WebGPU compute shaders.
 ## Usage
 
 ```bash
-python main.py input.mp4 --out masks/ --blur_radius 3 --max_frames 10
+python main.py input.mp4 --out masks/ --blur_radius 3 --erode_iters 1 --dilate_iters 1 --max_frames 10
 ```
 
 ## CLI flags
@@ -18,3 +18,5 @@ python main.py input.mp4 --out masks/ --blur_radius 3 --max_frames 10
 | `--gamma` | `1.0` | Gamma bias on matte edges |
 | `--max_frames` | all | Stop after N frames |
 | `--blur_radius` | `0` | Separable box blur radius (0=off, max 8) |
+| `--erode_iters` | `0` | Erode iterations (3x3 min, removes speckle) |
+| `--dilate_iters` | `0` | Dilate iterations (3x3 max, fills small holes) |

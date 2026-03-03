@@ -1,0 +1,31 @@
+{
+  // Use Ruff as formatter
+  "editor.defaultFormatter": "charliermarsh.ruff",
+
+  // Format on save
+  "editor.formatOnSave": true,
+
+  // Run code actions on save
+  "editor.codeActionsOnSave": {
+    "source.fixAll": "always",
+    "source.organizeImports": "always"
+  },
+
+  // Enable Ruff linting
+  "ruff.enable": true,
+  "ruff.fixAll": true,
+
+  // Use project venv
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+
+  
+    // Use Ruff as the formatter
+    "[python]": {
+      "editor.defaultFormatter": "charliermarsh.ruff",
+      "editor.formatOnSave": true,
+      "editor.codeActionsOnSave": {
+        "source.fixAll": "explicit",
+        "source.organizeImports": "explicit"
+      }
+    },
+}

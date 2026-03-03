@@ -427,13 +427,18 @@ dependencies = [
     { name = "numpy" },
     { name = "pillow" },
     { name = "rich" },
-    { name = "rich-argparse" },
     { name = "wgpu" },
+]
+
+[package.optional-dependencies]
+cli = [
+    { name = "rich-argparse" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "rich-argparse" },
     { name = "ruff" },
     { name = "ty" },
 ]
@@ -444,13 +449,15 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "pillow", specifier = ">=12.1.1" },
     { name = "rich", specifier = ">=14.3.3" },
-    { name = "rich-argparse", specifier = ">=1.7.2" },
+    { name = "rich-argparse", marker = "extra == 'cli'", specifier = ">=1.7.2" },
     { name = "wgpu", specifier = ">=0.31.0" },
 ]
+provides-extras = ["cli"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=9.0.2" },
+    { name = "rich-argparse", specifier = ">=1.7.2" },
     { name = "ruff", specifier = ">=0.15.4" },
     { name = "ty", specifier = ">=0.0.20" },
 ]

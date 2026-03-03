@@ -4,10 +4,12 @@ import argparse
 
 from rich_argparse import RichHelpFormatter
 
+from .console import setup_logging
 from .pipeline import process_video
 
 
 def cli() -> None:
+    setup_logging()
     parser = argparse.ArgumentParser(
         description="GPU-accelerated green-screen keying via WebGPU compute shaders.",
         formatter_class=RichHelpFormatter,

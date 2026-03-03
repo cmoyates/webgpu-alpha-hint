@@ -8,7 +8,7 @@ from .shader_utils import BYTES_PER_PIXEL
 TEX_FORMAT = wgpu.TextureFormat.rgba8unorm
 
 
-def create_texture(device, width: int, height: int, usage):
+def create_texture(device: wgpu.GPUDevice, width: int, height: int, usage: int) -> wgpu.GPUTexture:
     """Create a 2D rgba8unorm texture with the given usage flags."""
     return device.create_texture(
         size=(width, height, 1),
@@ -18,7 +18,7 @@ def create_texture(device, width: int, height: int, usage):
     )
 
 
-def upload_rgba(device, texture, data: np.ndarray):
+def upload_rgba(device: wgpu.GPUDevice, texture: wgpu.GPUTexture, data: np.ndarray) -> None:
     """Upload uint8 RGBA array (H, W, 4) to texture."""
     frame_height, frame_width, _ = data.shape
     bytes_per_row = frame_width * BYTES_PER_PIXEL
@@ -30,7 +30,7 @@ def upload_rgba(device, texture, data: np.ndarray):
     )
 
 
-def readback_r_channel(device, texture, width: int, height: int) -> np.ndarray:
+def readback_r_channel(device: wgpu.GPUDevice, texture: wgpu.GPUTexture, width: int, height: int) -> np.ndarray:
     """Read back R channel as float array (H, W) in [0, 1]."""
     bytes_per_row = width * BYTES_PER_PIXEL
     # WebGPU spec requires bytes_per_row aligned to 256

@@ -4,20 +4,24 @@ version = "0.1.0"
 description = "GPU-accelerated green-screen keying via WebGPU compute shaders"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
 dependencies = [
     "av>=16.1.0",
     "numpy>=2.4.2",
     "pillow>=12.1.1",
     "rich>=14.3.3",
-    "rich-argparse>=1.7.2",
     "wgpu>=0.31.0",
 ]
+
+[project.optional-dependencies]
+cli = ["rich-argparse>=1.7.2"]
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
     "ruff>=0.15.4",
     "ty>=0.0.20",
+    "rich-argparse>=1.7.2",
 ]
 
 [build-system]

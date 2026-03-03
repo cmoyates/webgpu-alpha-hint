@@ -32,46 +32,53 @@ def load_wgsl(path: str) -> str:
         return f.read()
 
 
-def create_texture(device, w, h, usage):
+def create_texture(device, width, height, usage):
     return device.create_texture(
-        size=(w, h, 1),
+        size=(width, height, 1),
         dimension=wgpu.TextureDimension.d2,
         format=TEX_FORMAT,
         usage=usage,
     )
 
 
-def upload_rgba(device, tex, data: np.ndarray):
+def upload_rgba(device, texture, data: np.ndarray):
     """Upload uint8 RGBA array (H, W, 4) to texture."""
-    h, w, _ = data.shape
-    bpr = w * BYTES_PER_PIXEL
+    frame_height, frame_width, _ = data.shape
+    bytes_per_row = frame_width * BYTES_PER_PIXEL
     device.queue.write_texture(
-        {"texture": tex, "mip_level": 0, "origin": (0, 0, 0)},
+        {"texture": texture, "mip_level": 0, "origin": (0, 0, 0)},
         data.tobytes(),
-        {"bytes_per_row": bpr, "rows_per_image": h},
-        (w, h, 1),
+        {"bytes_per_row": bytes_per_row, "rows_per_image": frame_height},
+        (frame_width, frame_height, 1),
     )
 
 
-def readback_r_channel(device, tex, w, h) -> np.ndarray:
+def readback_r_channel(device, texture, width, height) -> np.ndarray:
     """Read back R channel as float array (H, W) in [0, 1]."""
-    bpr = w * BYTES_PER_PIXEL
-    padded_bpr = ((bpr + 255) // 256) * 256
-    buf = device.create_buffer(
-        size=padded_bpr * h,
+    bytes_per_row = width * BYTES_PER_PIXEL
+    padded_bytes_per_row = ((bytes_per_row + 255) // 256) * 256
+    readback_buffer = device.create_buffer(
+        size=padded_bytes_per_row * height,
         usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
     )
-    enc = device.create_command_encoder()
-    enc.copy_texture_to_buffer(
-        {"texture": tex, "mip_level": 0, "origin": (0, 0, 0)},
-        {"buffer": buf, "offset": 0, "bytes_per_row": padded_bpr, "rows_per_image": h},
-        (w, h, 1),
+    command_encoder = device.create_command_encoder()
+    command_encoder.copy_texture_to_buffer(
+        {"texture": texture, "mip_level": 0, "origin": (0, 0, 0)},
+        {
+            "buffer": readback_buffer,
+            "offset": 0,
+            "bytes_per_row": padded_bytes_per_row,
+            "rows_per_image": height,
+        },
+        (width, height, 1),
     )
-    device.queue.submit([enc.finish()])
-    buf.map_sync(mode=wgpu.MapMode.READ)
-    raw = np.frombuffer(buf.read_mapped(), dtype=np.uint8).reshape((h, padded_bpr))
-    rgba = raw[:, :bpr].reshape((h, w, 4)).copy()
-    buf.unmap()
+    device.queue.submit([command_encoder.finish()])
+    readback_buffer.map_sync(mode=wgpu.MapMode.READ)
+    raw = np.frombuffer(readback_buffer.read_mapped(), dtype=np.uint8).reshape(
+        (height, padded_bytes_per_row)
+    )
+    rgba = raw[:, :bytes_per_row].reshape((height, width, 4)).copy()
+    readback_buffer.unmap()
     return rgba[:, :, 0].astype(np.float32) / 255.0
 
 
@@ -80,20 +87,20 @@ def readback_r_channel(device, tex, w, h) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def solid_rgba(w, h, r, g, b, a=255):
-    img = np.zeros((h, w, 4), dtype=np.uint8)
-    img[:, :] = [r, g, b, a]
-    return img
+def solid_rgba(width, height, red, green, blue, alpha=255):
+    image = np.zeros((height, width, 4), dtype=np.uint8)
+    image[:, :] = [red, green, blue, alpha]
+    return image
 
 
 def matte_to_rgba(matte_float: np.ndarray) -> np.ndarray:
     """Convert (H,W) float [0,1] matte back to uint8 RGBA for piping between stages."""
-    v = np.clip(matte_float * 255.0, 0, 255).astype(np.uint8)
-    h, w = v.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[:, :, 0] = v
-    rgba[:, :, 1] = v
-    rgba[:, :, 2] = v
+    matte_uint8 = np.clip(matte_float * 255.0, 0, 255).astype(np.uint8)
+    frame_height, frame_width = matte_uint8.shape
+    rgba = np.zeros((frame_height, frame_width, 4), dtype=np.uint8)
+    rgba[:, :, 0] = matte_uint8
+    rgba[:, :, 1] = matte_uint8
+    rgba[:, :, 2] = matte_uint8
     rgba[:, :, 3] = 255
     return rgba
 
@@ -103,34 +110,43 @@ def matte_to_rgba(matte_float: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def normalize_key(r, g, b):
-    s = r + g + b + 1e-4
-    return r / s, g / s, b / s
+def normalize_key(red, green, blue):
+    channel_sum = red + green + blue + 1e-4
+    return red / channel_sum, green / channel_sum, blue / channel_sum
 
 
 def make_key_params(key_r=0.0, key_g=1.0, key_b=0.0, softness=0.3, gamma=1.0, sat_gate=0.1):
-    knr, kng, knb = normalize_key(key_r, key_g, key_b)
-    return np.array([knr, kng, knb, softness, gamma, sat_gate, 0.0, 0.0], dtype=np.float32)
+    key_norm_r, key_norm_g, key_norm_b = normalize_key(key_r, key_g, key_b)
+    return np.array(
+        [key_norm_r, key_norm_g, key_norm_b, softness, gamma, sat_gate, 0.0, 0.0],
+        dtype=np.float32,
+    )
 
 
 def run_key_pass(device, input_rgba: np.ndarray, params: np.ndarray) -> np.ndarray:
     """Run keying shader on input_rgba (H,W,4 uint8), return R channel as float (H,W)."""
-    h, w = input_rgba.shape[:2]
+    frame_height, frame_width = input_rgba.shape[:2]
 
-    in_tex = create_texture(
-        device, w, h, wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST
+    input_texture = create_texture(
+        device,
+        frame_width,
+        frame_height,
+        wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
     )
-    out_tex = create_texture(
-        device, w, h, wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.COPY_SRC
+    output_texture = create_texture(
+        device,
+        frame_width,
+        frame_height,
+        wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.COPY_SRC,
     )
-    upload_rgba(device, in_tex, input_rgba)
+    upload_rgba(device, input_texture, input_rgba)
 
-    params_buf = device.create_buffer_with_data(
+    params_buffer = device.create_buffer_with_data(
         data=params.tobytes(), usage=wgpu.BufferUsage.UNIFORM
     )
 
     shader = device.create_shader_module(code=load_wgsl("alpha_hint.wgsl"))
-    bgl = device.create_bind_group_layout(
+    bind_group_layout = device.create_bind_group_layout(
         entries=[
             {
                 "binding": 0,
@@ -154,27 +170,30 @@ def run_key_pass(device, input_rgba: np.ndarray, params: np.ndarray) -> np.ndarr
         ]
     )
     pipeline = device.create_compute_pipeline(
-        layout=device.create_pipeline_layout(bind_group_layouts=[bgl]),
+        layout=device.create_pipeline_layout(bind_group_layouts=[bind_group_layout]),
         compute={"module": shader, "entry_point": "main"},
     )
-    bg = device.create_bind_group(
-        layout=bgl,
+    bind_group = device.create_bind_group(
+        layout=bind_group_layout,
         entries=[
-            {"binding": 0, "resource": in_tex.create_view()},
-            {"binding": 1, "resource": out_tex.create_view()},
-            {"binding": 2, "resource": {"buffer": params_buf, "offset": 0, "size": 32}},
+            {"binding": 0, "resource": input_texture.create_view()},
+            {"binding": 1, "resource": output_texture.create_view()},
+            {
+                "binding": 2,
+                "resource": {"buffer": params_buffer, "offset": 0, "size": 32},
+            },
         ],
     )
 
-    enc = device.create_command_encoder()
-    cp = enc.begin_compute_pass()
-    cp.set_pipeline(pipeline)
-    cp.set_bind_group(0, bg, [], 0, 999999)
-    cp.dispatch_workgroups((w + 15) // 16, (h + 15) // 16, 1)
-    cp.end()
-    device.queue.submit([enc.finish()])
+    command_encoder = device.create_command_encoder()
+    compute_pass = command_encoder.begin_compute_pass()
+    compute_pass.set_pipeline(pipeline)
+    compute_pass.set_bind_group(0, bind_group, [], 0, 999999)
+    compute_pass.dispatch_workgroups((frame_width + 15) // 16, (frame_height + 15) // 16, 1)
+    compute_pass.end()
+    device.queue.submit([command_encoder.finish()])
 
-    return readback_r_channel(device, out_tex, w, h)
+    return readback_r_channel(device, output_texture, frame_width, frame_height)
 
 
 # ---------------------------------------------------------------------------
@@ -184,25 +203,34 @@ def run_key_pass(device, input_rgba: np.ndarray, params: np.ndarray) -> np.ndarr
 
 def run_blur_pass(device, input_rgba: np.ndarray, radius: int) -> np.ndarray:
     """Run horizontal + vertical blur on input (H,W,4 uint8), return R channel float."""
-    h, w = input_rgba.shape[:2]
+    frame_height, frame_width = input_rgba.shape[:2]
 
-    in_tex = create_texture(
-        device, w, h, wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST
+    input_texture = create_texture(
+        device,
+        frame_width,
+        frame_height,
+        wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
     )
-    temp_tex = create_texture(
-        device, w, h, wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING
+    intermediate_texture = create_texture(
+        device,
+        frame_width,
+        frame_height,
+        wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
     )
-    out_tex = create_texture(
-        device, w, h, wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.COPY_SRC
+    output_texture = create_texture(
+        device,
+        frame_width,
+        frame_height,
+        wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.COPY_SRC,
     )
-    upload_rgba(device, in_tex, input_rgba)
+    upload_rgba(device, input_texture, input_rgba)
 
     blur_params = np.array([radius, 0, 0, 0], dtype=np.int32)
-    blur_buf = device.create_buffer_with_data(
+    blur_params_buffer = device.create_buffer_with_data(
         data=blur_params.tobytes(), usage=wgpu.BufferUsage.UNIFORM
     )
     shader = device.create_shader_module(code=load_wgsl("blur.wgsl"))
-    bgl = device.create_bind_group_layout(
+    bind_group_layout = device.create_bind_group_layout(
         entries=[
             {
                 "binding": 0,
@@ -225,46 +253,63 @@ def run_blur_pass(device, input_rgba: np.ndarray, radius: int) -> np.ndarray:
             },
         ]
     )
-    layout = device.create_pipeline_layout(bind_group_layouts=[bgl])
-    h_pipe = device.create_compute_pipeline(
-        layout=layout, compute={"module": shader, "entry_point": "blur_h"}
+    pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[bind_group_layout])
+    horizontal_blur_pipeline = device.create_compute_pipeline(
+        layout=pipeline_layout,
+        compute={"module": shader, "entry_point": "blur_h"},
     )
-    v_pipe = device.create_compute_pipeline(
-        layout=layout, compute={"module": shader, "entry_point": "blur_v"}
+    vertical_blur_pipeline = device.create_compute_pipeline(
+        layout=pipeline_layout,
+        compute={"module": shader, "entry_point": "blur_v"},
     )
 
-    bg_h = device.create_bind_group(
-        layout=bgl,
+    horizontal_bind_group = device.create_bind_group(
+        layout=bind_group_layout,
         entries=[
-            {"binding": 0, "resource": in_tex.create_view()},
-            {"binding": 1, "resource": temp_tex.create_view()},
-            {"binding": 2, "resource": {"buffer": blur_buf, "offset": 0, "size": 16}},
+            {"binding": 0, "resource": input_texture.create_view()},
+            {"binding": 1, "resource": intermediate_texture.create_view()},
+            {
+                "binding": 2,
+                "resource": {
+                    "buffer": blur_params_buffer,
+                    "offset": 0,
+                    "size": 16,
+                },
+            },
         ],
     )
-    bg_v = device.create_bind_group(
-        layout=bgl,
+    vertical_bind_group = device.create_bind_group(
+        layout=bind_group_layout,
         entries=[
-            {"binding": 0, "resource": temp_tex.create_view()},
-            {"binding": 1, "resource": out_tex.create_view()},
-            {"binding": 2, "resource": {"buffer": blur_buf, "offset": 0, "size": 16}},
+            {"binding": 0, "resource": intermediate_texture.create_view()},
+            {"binding": 1, "resource": output_texture.create_view()},
+            {
+                "binding": 2,
+                "resource": {
+                    "buffer": blur_params_buffer,
+                    "offset": 0,
+                    "size": 16,
+                },
+            },
         ],
     )
 
-    gx, gy = (w + 15) // 16, (h + 15) // 16
-    enc = device.create_command_encoder()
-    cp = enc.begin_compute_pass()
-    cp.set_pipeline(h_pipe)
-    cp.set_bind_group(0, bg_h, [], 0, 999999)
-    cp.dispatch_workgroups(gx, gy, 1)
-    cp.end()
-    cp2 = enc.begin_compute_pass()
-    cp2.set_pipeline(v_pipe)
-    cp2.set_bind_group(0, bg_v, [], 0, 999999)
-    cp2.dispatch_workgroups(gx, gy, 1)
-    cp2.end()
-    device.queue.submit([enc.finish()])
+    workgroup_count_x = (frame_width + 15) // 16
+    workgroup_count_y = (frame_height + 15) // 16
+    command_encoder = device.create_command_encoder()
+    horizontal_pass = command_encoder.begin_compute_pass()
+    horizontal_pass.set_pipeline(horizontal_blur_pipeline)
+    horizontal_pass.set_bind_group(0, horizontal_bind_group, [], 0, 999999)
+    horizontal_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+    horizontal_pass.end()
+    vertical_pass = command_encoder.begin_compute_pass()
+    vertical_pass.set_pipeline(vertical_blur_pipeline)
+    vertical_pass.set_bind_group(0, vertical_bind_group, [], 0, 999999)
+    vertical_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+    vertical_pass.end()
+    device.queue.submit([command_encoder.finish()])
 
-    return readback_r_channel(device, out_tex, w, h)
+    return readback_r_channel(device, output_texture, frame_width, frame_height)
 
 
 # ---------------------------------------------------------------------------
@@ -274,18 +319,24 @@ def run_blur_pass(device, input_rgba: np.ndarray, radius: int) -> np.ndarray:
 
 def run_morph_pass(device, input_rgba: np.ndarray, entry_point: str) -> np.ndarray:
     """Run one morphology pass (erode or dilate) on input, return R channel float."""
-    h, w = input_rgba.shape[:2]
+    frame_height, frame_width = input_rgba.shape[:2]
 
-    in_tex = create_texture(
-        device, w, h, wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST
+    input_texture = create_texture(
+        device,
+        frame_width,
+        frame_height,
+        wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
     )
-    out_tex = create_texture(
-        device, w, h, wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.COPY_SRC
+    output_texture = create_texture(
+        device,
+        frame_width,
+        frame_height,
+        wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.COPY_SRC,
     )
-    upload_rgba(device, in_tex, input_rgba)
+    upload_rgba(device, input_texture, input_rgba)
 
     shader = device.create_shader_module(code=load_wgsl("morphology.wgsl"))
-    bgl = device.create_bind_group_layout(
+    bind_group_layout = device.create_bind_group_layout(
         entries=[
             {
                 "binding": 0,
@@ -304,23 +355,23 @@ def run_morph_pass(device, input_rgba: np.ndarray, entry_point: str) -> np.ndarr
         ]
     )
     pipeline = device.create_compute_pipeline(
-        layout=device.create_pipeline_layout(bind_group_layouts=[bgl]),
+        layout=device.create_pipeline_layout(bind_group_layouts=[bind_group_layout]),
         compute={"module": shader, "entry_point": entry_point},
     )
-    bg = device.create_bind_group(
-        layout=bgl,
+    bind_group = device.create_bind_group(
+        layout=bind_group_layout,
         entries=[
-            {"binding": 0, "resource": in_tex.create_view()},
-            {"binding": 1, "resource": out_tex.create_view()},
+            {"binding": 0, "resource": input_texture.create_view()},
+            {"binding": 1, "resource": output_texture.create_view()},
         ],
     )
 
-    enc = device.create_command_encoder()
-    cp = enc.begin_compute_pass()
-    cp.set_pipeline(pipeline)
-    cp.set_bind_group(0, bg, [], 0, 999999)
-    cp.dispatch_workgroups((w + 15) // 16, (h + 15) // 16, 1)
-    cp.end()
-    device.queue.submit([enc.finish()])
+    command_encoder = device.create_command_encoder()
+    compute_pass = command_encoder.begin_compute_pass()
+    compute_pass.set_pipeline(pipeline)
+    compute_pass.set_bind_group(0, bind_group, [], 0, 999999)
+    compute_pass.dispatch_workgroups((frame_width + 15) // 16, (frame_height + 15) // 16, 1)
+    compute_pass.end()
+    device.queue.submit([command_encoder.finish()])
 
-    return readback_r_channel(device, out_tex, w, h)
+    return readback_r_channel(device, output_texture, frame_width, frame_height)

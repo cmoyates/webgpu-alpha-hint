@@ -15,20 +15,20 @@ fn blur_h(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(inputTex);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
 
-  let r = blur_params.radius;
-  let y = i32(gid.y);
+  let radius = blur_params.radius;
+  let center_y = i32(gid.y);
   let max_x = i32(size.x) - 1;
-  var sum = vec3<f32>(0.0);
-  var count = 0.0;
+  var color_sum = vec3<f32>(0.0);
+  var sample_count = 0.0;
 
-  for (var dx = -r; dx <= r; dx = dx + 1) {
-    let sx = clamp(i32(gid.x) + dx, 0, max_x);
-    sum += textureLoad(inputTex, vec2<i32>(sx, y), 0).rgb;
-    count += 1.0;
+  for (var dx = -radius; dx <= radius; dx = dx + 1) {
+    let sample_x = clamp(i32(gid.x) + dx, 0, max_x);
+    color_sum += textureLoad(inputTex, vec2<i32>(sample_x, center_y), 0).rgb;
+    sample_count += 1.0;
   }
 
-  let avg = sum / count;
-  textureStore(outputTex, vec2<i32>(i32(gid.x), y), vec4<f32>(avg, 1.0));
+  let average_color = color_sum / sample_count;
+  textureStore(outputTex, vec2<i32>(i32(gid.x), center_y), vec4<f32>(average_color, 1.0));
 }
 
 @compute @workgroup_size(16, 16)
@@ -36,18 +36,18 @@ fn blur_v(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(inputTex);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
 
-  let r = blur_params.radius;
-  let x = i32(gid.x);
+  let radius = blur_params.radius;
+  let center_x = i32(gid.x);
   let max_y = i32(size.y) - 1;
-  var sum = vec3<f32>(0.0);
-  var count = 0.0;
+  var color_sum = vec3<f32>(0.0);
+  var sample_count = 0.0;
 
-  for (var dy = -r; dy <= r; dy = dy + 1) {
-    let sy = clamp(i32(gid.y) + dy, 0, max_y);
-    sum += textureLoad(inputTex, vec2<i32>(x, sy), 0).rgb;
-    count += 1.0;
+  for (var dy = -radius; dy <= radius; dy = dy + 1) {
+    let sample_y = clamp(i32(gid.y) + dy, 0, max_y);
+    color_sum += textureLoad(inputTex, vec2<i32>(center_x, sample_y), 0).rgb;
+    sample_count += 1.0;
   }
 
-  let avg = sum / count;
-  textureStore(outputTex, vec2<i32>(x, i32(gid.y)), vec4<f32>(avg, 1.0));
+  let average_color = color_sum / sample_count;
+  textureStore(outputTex, vec2<i32>(center_x, i32(gid.y)), vec4<f32>(average_color, 1.0));
 }

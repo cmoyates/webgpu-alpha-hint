@@ -22,8 +22,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let size = textureDimensions(inputTex);
   if (gid.x >= size.x || gid.y >= size.y) { return; }
 
-  let uv = vec2<i32>(i32(gid.x), i32(gid.y));
-  let rgb = textureLoad(inputTex, uv, 0).rgb;
+  let pixel_coords = vec2<i32>(i32(gid.x), i32(gid.y));
+  let rgb = textureLoad(inputTex, pixel_coords, 0).rgb;
 
   // Normalized chroma: project pixel into chromaticity space
   let pixel_sum = rgb.r + rgb.g + rgb.b + CHROMA_EPS;
@@ -36,23 +36,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Map distance to alpha: close to key => 0 (background), far => 1 (foreground)
   // softness controls the transition band width
-  let half_soft = params.softness * 0.5;
-  let d_lo = max(half_soft, CHROMA_EPS);
-  let d_hi = d_lo + params.softness;
-  let t = clamp((chroma_dist - d_lo) / (d_hi - d_lo + CHROMA_EPS), 0.0, 1.0);
-  var a = t * t * (3.0 - 2.0 * t); // smoothstep
+  let half_softness = params.softness * 0.5;
+  let distance_lower = max(half_softness, CHROMA_EPS);
+  let distance_upper = distance_lower + params.softness;
+  let smoothstep_input = clamp((chroma_dist - distance_lower) / (distance_upper - distance_lower + CHROMA_EPS), 0.0, 1.0);
+  var alpha = smoothstep_input * smoothstep_input * (3.0 - 2.0 * smoothstep_input); // smoothstep
 
   // Saturation gate: protect low-saturation pixels (grey, white, black)
-  let sat = max(rgb.r, max(rgb.g, rgb.b)) - min(rgb.r, min(rgb.g, rgb.b));
-  if (sat < params.sat_gate) {
+  let saturation = max(rgb.r, max(rgb.g, rgb.b)) - min(rgb.r, min(rgb.g, rgb.b));
+  if (saturation < params.sat_gate) {
     // Lerp alpha toward 1.0 as saturation drops below gate
-    let gate_factor = sat / max(params.sat_gate, CHROMA_EPS);
-    a = mix(1.0, a, gate_factor);
+    let gate_factor = saturation / max(params.sat_gate, CHROMA_EPS);
+    alpha = mix(1.0, alpha, gate_factor);
   }
 
   // Gamma bias on edges
-  a = pow(a, params.gamma);
+  alpha = pow(alpha, params.gamma);
 
   // Write grayscale matte (no hard threshold — preserve soft edges)
-  textureStore(outputTex, uv, vec4<f32>(a, a, a, 1.0));
+  textureStore(outputTex, pixel_coords, vec4<f32>(alpha, alpha, alpha, 1.0));
 }

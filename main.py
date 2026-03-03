@@ -13,6 +13,8 @@ def load_wgsl(path: str) -> str:
 
 
 MAX_BLUR_RADIUS = 8
+BYTES_PER_PIXEL = 4
+BYTES_PER_ROW_ALIGNMENT = 256
 
 
 def main(
@@ -34,8 +36,8 @@ def main(
     dilate_iters = max(dilate_iters, 0)
     total_morph_iters = erode_iters + dilate_iters
 
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    output_path = Path(out_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
     # --- Decode first frame to get size ---
     container = av.open(input_video)
@@ -43,7 +45,7 @@ def main(
     stream.thread_type = "AUTO"
 
     first_frame = next(container.decode(stream))
-    width, height = first_frame.width, first_frame.height
+    frame_width, frame_height = first_frame.width, first_frame.height
 
     # Re-open so we start from frame 0
     container.close()
@@ -57,46 +59,46 @@ def main(
         raise RuntimeError("No WebGPU adapter found.")
     device = adapter.request_device_sync()
 
-    key_shader = device.create_shader_module(code=load_wgsl("alpha_hint.wgsl"))
+    keying_shader = device.create_shader_module(code=load_wgsl("alpha_hint.wgsl"))
 
     # Input texture: rgba8unorm (we upload uint8 RGBA)
-    input_tex = device.create_texture(
-        size=(width, height, 1),
+    input_texture = device.create_texture(
+        size=(frame_width, frame_height, 1),
         dimension=wgpu.TextureDimension.d2,
         format=wgpu.TextureFormat.rgba8unorm,
         usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
     )
-    input_view = input_tex.create_view()
+    input_texture_view = input_texture.create_view()
 
     # Output texture: final result, always needed for readback
-    output_tex = device.create_texture(
-        size=(width, height, 1),
+    output_texture = device.create_texture(
+        size=(frame_width, frame_height, 1),
         dimension=wgpu.TextureDimension.d2,
         format=wgpu.TextureFormat.rgba8unorm,
         usage=wgpu.TextureUsage.STORAGE_BINDING
         | wgpu.TextureUsage.COPY_SRC
         | wgpu.TextureUsage.COPY_DST,
     )
-    output_view = output_tex.create_view()
+    output_texture_view = output_texture.create_view()
 
     # Pre-normalize key color on CPU (avoids per-pixel division in shader)
-    key_sum = key_r + key_g + key_b + 1e-4
-    key_norm_r = key_r / key_sum
-    key_norm_g = key_g / key_sum
-    key_norm_b = key_b / key_sum
+    key_channel_sum = key_r + key_g + key_b + 1e-4
+    key_norm_r = key_r / key_channel_sum
+    key_norm_g = key_g / key_channel_sum
+    key_norm_b = key_b / key_channel_sum
 
     # Keying params uniform: 8 x f32 = 32 bytes
-    params_data = np.array(
+    keying_params_data = np.array(
         [key_norm_r, key_norm_g, key_norm_b, softness, gamma, sat_gate, 0.0, 0.0],
         dtype=np.float32,
     )
-    params_buf = device.create_buffer_with_data(
-        data=params_data.tobytes(),
+    keying_params_buffer = device.create_buffer_with_data(
+        data=keying_params_data.tobytes(),
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
 
     # --- Key pass bind group layout (shared pattern: tex_2d + storage_tex + uniform) ---
-    key_bgl = device.create_bind_group_layout(
+    keying_bind_group_layout = device.create_bind_group_layout(
         entries=[
             {
                 "binding": 0,
@@ -120,7 +122,9 @@ def main(
         ]
     )
 
-    key_pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[key_bgl])
+    keying_pipeline_layout = device.create_pipeline_layout(
+        bind_group_layouts=[keying_bind_group_layout]
+    )
 
     # Determine where keying and blur write their result.
     # If morphology follows, the pre-morph stage writes to morph_ping.
@@ -128,70 +132,77 @@ def main(
     # Otherwise, key writes directly to output.
 
     if blur_radius > 0:
-        # Intermediate texture: keying result, read by blur_h
-        intermediate_tex = device.create_texture(
-            size=(width, height, 1),
+        # Intermediate texture: keying result, read by horizontal blur
+        keying_output_texture = device.create_texture(
+            size=(frame_width, frame_height, 1),
             dimension=wgpu.TextureDimension.d2,
             format=wgpu.TextureFormat.rgba8unorm,
             usage=wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
         )
-        intermediate_view = intermediate_tex.create_view()
+        keying_output_view = keying_output_texture.create_view()
 
-        # Temp texture for between blur_h and blur_v
-        blur_temp_tex = device.create_texture(
-            size=(width, height, 1),
+        # Temp texture for between horizontal and vertical blur
+        blur_intermediate_texture = device.create_texture(
+            size=(frame_width, frame_height, 1),
             dimension=wgpu.TextureDimension.d2,
             format=wgpu.TextureFormat.rgba8unorm,
             usage=wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
         )
-        blur_temp_view = blur_temp_tex.create_view()
+        blur_intermediate_view = blur_intermediate_texture.create_view()
 
-        key_dest_view = intermediate_view
+        keying_dest_view = keying_output_view
     else:
-        key_dest_view = output_view
+        keying_dest_view = output_texture_view
 
     # --- Morphology ping-pong textures ---
     if total_morph_iters > 0:
-        morph_tex_usage = (
+        morphology_texture_usage = (
             wgpu.TextureUsage.STORAGE_BINDING
             | wgpu.TextureUsage.TEXTURE_BINDING
             | wgpu.TextureUsage.COPY_SRC
         )
-        morph_ping_tex = device.create_texture(
-            size=(width, height, 1),
+        morph_ping_texture = device.create_texture(
+            size=(frame_width, frame_height, 1),
             dimension=wgpu.TextureDimension.d2,
             format=wgpu.TextureFormat.rgba8unorm,
-            usage=morph_tex_usage,
+            usage=morphology_texture_usage,
         )
-        morph_ping_view = morph_ping_tex.create_view()
+        morph_ping_view = morph_ping_texture.create_view()
 
-        morph_pong_tex = device.create_texture(
-            size=(width, height, 1),
+        morph_pong_texture = device.create_texture(
+            size=(frame_width, frame_height, 1),
             dimension=wgpu.TextureDimension.d2,
             format=wgpu.TextureFormat.rgba8unorm,
-            usage=morph_tex_usage,
+            usage=morphology_texture_usage,
         )
-        morph_pong_view = morph_pong_tex.create_view()
+        morph_pong_view = morph_pong_texture.create_view()
 
         # Redirect the last pre-morph stage to write to morph_ping
         if blur_radius > 0:
-            blur_v_dest_view = morph_ping_view
+            vertical_blur_dest_view = morph_ping_view
         else:
-            key_dest_view = morph_ping_view
+            keying_dest_view = morph_ping_view
     else:
-        blur_v_dest_view = output_view if blur_radius > 0 else None
+        vertical_blur_dest_view = output_texture_view if blur_radius > 0 else None
 
-    key_pipeline = device.create_compute_pipeline(
-        layout=key_pipeline_layout,
-        compute={"module": key_shader, "entry_point": "main"},
+    keying_pipeline = device.create_compute_pipeline(
+        layout=keying_pipeline_layout,
+        compute={"module": keying_shader, "entry_point": "main"},
     )
 
-    key_bind_group = device.create_bind_group(
-        layout=key_bgl,
+    keying_bind_group = device.create_bind_group(
+        layout=keying_bind_group_layout,
         entries=[
-            {"binding": 0, "resource": input_view},
-            {"binding": 1, "resource": key_dest_view},
-            {"binding": 2, "resource": {"buffer": params_buf, "offset": 0, "size": 32}},
+            {"binding": 0, "resource": input_texture_view},
+            {"binding": 1, "resource": keying_dest_view},
+            {
+                "binding": 2,
+                "resource": {
+                    "buffer": keying_params_buffer,
+                    "offset": 0,
+                    "size": 32,
+                },
+            },
         ],
     )
 
@@ -199,15 +210,13 @@ def main(
     if blur_radius > 0:
         blur_shader = device.create_shader_module(code=load_wgsl("blur.wgsl"))
 
-        blur_params_data = np.array(
-            [blur_radius, 0, 0, 0], dtype=np.int32
-        )
-        blur_params_buf = device.create_buffer_with_data(
+        blur_params_data = np.array([blur_radius, 0, 0, 0], dtype=np.int32)
+        blur_params_buffer = device.create_buffer_with_data(
             data=blur_params_data.tobytes(),
             usage=wgpu.BufferUsage.UNIFORM,
         )
 
-        blur_bgl = device.create_bind_group_layout(
+        blur_bind_group_layout = device.create_bind_group_layout(
             entries=[
                 {
                     "binding": 0,
@@ -232,27 +241,27 @@ def main(
         )
 
         blur_pipeline_layout = device.create_pipeline_layout(
-            bind_group_layouts=[blur_bgl]
+            bind_group_layouts=[blur_bind_group_layout]
         )
 
-        blur_h_pipeline = device.create_compute_pipeline(
+        horizontal_blur_pipeline = device.create_compute_pipeline(
             layout=blur_pipeline_layout,
             compute={"module": blur_shader, "entry_point": "blur_h"},
         )
-        blur_v_pipeline = device.create_compute_pipeline(
+        vertical_blur_pipeline = device.create_compute_pipeline(
             layout=blur_pipeline_layout,
             compute={"module": blur_shader, "entry_point": "blur_v"},
         )
 
-        blur_h_bind_group = device.create_bind_group(
-            layout=blur_bgl,
+        horizontal_blur_bind_group = device.create_bind_group(
+            layout=blur_bind_group_layout,
             entries=[
-                {"binding": 0, "resource": intermediate_view},
-                {"binding": 1, "resource": blur_temp_view},
+                {"binding": 0, "resource": keying_output_view},
+                {"binding": 1, "resource": blur_intermediate_view},
                 {
                     "binding": 2,
                     "resource": {
-                        "buffer": blur_params_buf,
+                        "buffer": blur_params_buffer,
                         "offset": 0,
                         "size": 16,
                     },
@@ -260,16 +269,16 @@ def main(
             ],
         )
 
-        # blur_v writes to morph_ping (if morph follows) or output
-        blur_v_bind_group = device.create_bind_group(
-            layout=blur_bgl,
+        # vertical blur writes to morph_ping (if morph follows) or output
+        vertical_blur_bind_group = device.create_bind_group(
+            layout=blur_bind_group_layout,
             entries=[
-                {"binding": 0, "resource": blur_temp_view},
-                {"binding": 1, "resource": blur_v_dest_view},
+                {"binding": 0, "resource": blur_intermediate_view},
+                {"binding": 1, "resource": vertical_blur_dest_view},
                 {
                     "binding": 2,
                     "resource": {
-                        "buffer": blur_params_buf,
+                        "buffer": blur_params_buffer,
                         "offset": 0,
                         "size": 16,
                     },
@@ -279,10 +288,10 @@ def main(
 
     # --- Morphology pipelines and bind groups ---
     if total_morph_iters > 0:
-        morph_shader = device.create_shader_module(code=load_wgsl("morphology.wgsl"))
+        morphology_shader = device.create_shader_module(code=load_wgsl("morphology.wgsl"))
 
         # Morphology uses same 2-binding layout: tex_2d read + storage_tex write
-        morph_bgl = device.create_bind_group_layout(
+        morphology_bind_group_layout = device.create_bind_group_layout(
             entries=[
                 {
                     "binding": 0,
@@ -300,29 +309,29 @@ def main(
                 },
             ]
         )
-        morph_pipeline_layout = device.create_pipeline_layout(
-            bind_group_layouts=[morph_bgl]
+        morphology_pipeline_layout = device.create_pipeline_layout(
+            bind_group_layouts=[morphology_bind_group_layout]
         )
 
         erode_pipeline = device.create_compute_pipeline(
-            layout=morph_pipeline_layout,
-            compute={"module": morph_shader, "entry_point": "erode"},
+            layout=morphology_pipeline_layout,
+            compute={"module": morphology_shader, "entry_point": "erode"},
         )
         dilate_pipeline = device.create_compute_pipeline(
-            layout=morph_pipeline_layout,
-            compute={"module": morph_shader, "entry_point": "dilate"},
+            layout=morphology_pipeline_layout,
+            compute={"module": morphology_shader, "entry_point": "dilate"},
         )
 
-        # Pre-build bind groups for ping→pong and pong→ping
-        morph_bg_ping_to_pong = device.create_bind_group(
-            layout=morph_bgl,
+        # Pre-build bind groups for ping->pong and pong->ping
+        morph_bind_group_ping_to_pong = device.create_bind_group(
+            layout=morphology_bind_group_layout,
             entries=[
                 {"binding": 0, "resource": morph_ping_view},
                 {"binding": 1, "resource": morph_pong_view},
             ],
         )
-        morph_bg_pong_to_ping = device.create_bind_group(
-            layout=morph_bgl,
+        morph_bind_group_pong_to_ping = device.create_bind_group(
+            layout=morphology_bind_group_layout,
             entries=[
                 {"binding": 0, "resource": morph_pong_view},
                 {"binding": 1, "resource": morph_ping_view},
@@ -330,30 +339,37 @@ def main(
         )
 
         # Build iteration schedule: list of (pipeline, bind_group) tuples
-        # Data starts in morph_ping. Iterations alternate ping→pong, pong→ping.
-        morph_schedule = []
+        # Data starts in morph_ping. Iterations alternate ping->pong, pong->ping.
+        morphology_schedule = []
         reading_ping = True
         for _ in range(erode_iters):
-            bg = morph_bg_ping_to_pong if reading_ping else morph_bg_pong_to_ping
-            morph_schedule.append((erode_pipeline, bg))
+            bind_group = (
+                morph_bind_group_ping_to_pong if reading_ping else morph_bind_group_pong_to_ping
+            )
+            morphology_schedule.append((erode_pipeline, bind_group))
             reading_ping = not reading_ping
         for _ in range(dilate_iters):
-            bg = morph_bg_ping_to_pong if reading_ping else morph_bg_pong_to_ping
-            morph_schedule.append((dilate_pipeline, bg))
+            bind_group = (
+                morph_bind_group_ping_to_pong if reading_ping else morph_bind_group_pong_to_ping
+            )
+            morphology_schedule.append((dilate_pipeline, bind_group))
             reading_ping = not reading_ping
 
         # reading_ping tracks the *next* read source; the last write went to the other.
-        morph_result_tex = morph_ping_tex if reading_ping else morph_pong_tex
+        morphology_result_texture = morph_ping_texture if reading_ping else morph_pong_texture
 
     # Readback buffer (RGBA8)
-    bytes_per_pixel = 4
-    unpadded_bpr = width * bytes_per_pixel
+    unpadded_bytes_per_row = frame_width * BYTES_PER_PIXEL
 
     # WebGPU requires bytes_per_row to be multiple of 256.
-    padded_bpr = ((unpadded_bpr + 255) // 256) * 256
-    readback_size = padded_bpr * height
+    padded_bytes_per_row = (
+        (unpadded_bytes_per_row + BYTES_PER_ROW_ALIGNMENT - 1)
+        // BYTES_PER_ROW_ALIGNMENT
+        * BYTES_PER_ROW_ALIGNMENT
+    )
+    readback_size = padded_bytes_per_row * frame_height
 
-    readback_buf = device.create_buffer(
+    readback_buffer = device.create_buffer(
         size=readback_size,
         usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
     )
@@ -369,117 +385,131 @@ def main(
 
         # Upload frame to GPU texture
         device.queue.write_texture(
-            {"texture": input_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            {"texture": input_texture, "mip_level": 0, "origin": (0, 0, 0)},
             rgba.tobytes(),
-            {"bytes_per_row": unpadded_bpr, "rows_per_image": height},
-            (width, height, 1),
+            {"bytes_per_row": unpadded_bytes_per_row, "rows_per_image": frame_height},
+            (frame_width, frame_height, 1),
         )
 
         command_encoder = device.create_command_encoder()
-        gx = (width + 15) // 16
-        gy = (height + 15) // 16
+        workgroup_count_x = (frame_width + 15) // 16
+        workgroup_count_y = (frame_height + 15) // 16
 
         # Pass 1: keying
-        key_pass = command_encoder.begin_compute_pass()
-        key_pass.set_pipeline(key_pipeline)
-        key_pass.set_bind_group(0, key_bind_group, [], 0, 999999)
-        key_pass.dispatch_workgroups(gx, gy, 1)
-        key_pass.end()
+        keying_pass = command_encoder.begin_compute_pass()
+        keying_pass.set_pipeline(keying_pipeline)
+        keying_pass.set_bind_group(0, keying_bind_group, [], 0, 999999)
+        keying_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+        keying_pass.end()
 
         # Pass 2+3: separable blur (if enabled)
         if blur_radius > 0:
-            h_pass = command_encoder.begin_compute_pass()
-            h_pass.set_pipeline(blur_h_pipeline)
-            h_pass.set_bind_group(0, blur_h_bind_group, [], 0, 999999)
-            h_pass.dispatch_workgroups(gx, gy, 1)
-            h_pass.end()
+            horizontal_pass = command_encoder.begin_compute_pass()
+            horizontal_pass.set_pipeline(horizontal_blur_pipeline)
+            horizontal_pass.set_bind_group(0, horizontal_blur_bind_group, [], 0, 999999)
+            horizontal_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+            horizontal_pass.end()
 
-            v_pass = command_encoder.begin_compute_pass()
-            v_pass.set_pipeline(blur_v_pipeline)
-            v_pass.set_bind_group(0, blur_v_bind_group, [], 0, 999999)
-            v_pass.dispatch_workgroups(gx, gy, 1)
-            v_pass.end()
+            vertical_pass = command_encoder.begin_compute_pass()
+            vertical_pass.set_pipeline(vertical_blur_pipeline)
+            vertical_pass.set_bind_group(0, vertical_blur_bind_group, [], 0, 999999)
+            vertical_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+            vertical_pass.end()
 
         # Pass 4+: morphology iterations (if enabled)
         if total_morph_iters > 0:
-            for pipeline, bind_group in morph_schedule:
-                m_pass = command_encoder.begin_compute_pass()
-                m_pass.set_pipeline(pipeline)
-                m_pass.set_bind_group(0, bind_group, [], 0, 999999)
-                m_pass.dispatch_workgroups(gx, gy, 1)
-                m_pass.end()
+            for pipeline, bind_group in morphology_schedule:
+                morphology_pass = command_encoder.begin_compute_pass()
+                morphology_pass.set_pipeline(pipeline)
+                morphology_pass.set_bind_group(0, bind_group, [], 0, 999999)
+                morphology_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
+                morphology_pass.end()
 
-            # Copy morph result → output_tex for readback
+            # Copy morph result -> output_texture for readback
             command_encoder.copy_texture_to_texture(
-                {"texture": morph_result_tex, "mip_level": 0, "origin": (0, 0, 0)},
-                {"texture": output_tex, "mip_level": 0, "origin": (0, 0, 0)},
-                (width, height, 1),
+                {
+                    "texture": morphology_result_texture,
+                    "mip_level": 0,
+                    "origin": (0, 0, 0),
+                },
+                {"texture": output_texture, "mip_level": 0, "origin": (0, 0, 0)},
+                (frame_width, frame_height, 1),
             )
 
         command_encoder.copy_texture_to_buffer(
-            {"texture": output_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            {"texture": output_texture, "mip_level": 0, "origin": (0, 0, 0)},
             {
-                "buffer": readback_buf,
+                "buffer": readback_buffer,
                 "offset": 0,
-                "bytes_per_row": padded_bpr,
-                "rows_per_image": height,
+                "bytes_per_row": padded_bytes_per_row,
+                "rows_per_image": frame_height,
             },
-            (width, height, 1),
+            (frame_width, frame_height, 1),
         )
 
         device.queue.submit([command_encoder.finish()])
 
-        readback_buf.map_sync(mode=wgpu.MapMode.READ)
-        data = readback_buf.read_mapped()
-        raw = np.frombuffer(data, dtype=np.uint8).reshape((height, padded_bpr))
-        rgba_out = raw[:, :unpadded_bpr].reshape((height, width, 4)).copy()
-        readback_buf.unmap()
+        readback_buffer.map_sync(mode=wgpu.MapMode.READ)
+        data = readback_buffer.read_mapped()
+        raw = np.frombuffer(data, dtype=np.uint8).reshape((frame_height, padded_bytes_per_row))
+        rgba_out = raw[:, :unpadded_bytes_per_row].reshape((frame_height, frame_width, 4)).copy()
+        readback_buffer.unmap()
 
         matte = rgba_out[:, :, 0]
 
-        img = Image.fromarray(matte, mode="L")
-        img.save(out_path / f"mask_{frame_index:06d}.png")
+        image = Image.fromarray(matte, mode="L")
+        image.save(output_path / f"mask_{frame_index:06d}.png")
 
         frame_index += 1
         if frame_index % 30 == 0:
             print(f"Saved {frame_index} frames...")
 
     container.close()
-    print(f"Done. Saved {frame_index} PNG masks to {out_path}")
+    print(f"Done. Saved {frame_index} PNG masks to {output_path}")
 
 
 if __name__ == "__main__":
     import argparse
 
-    p = argparse.ArgumentParser()
-    p.add_argument("input_video")
-    p.add_argument("--out", default="alpha_hint_frames")
-    p.add_argument("--key_r", type=float, default=0.0, help="Key color red (0..1)")
-    p.add_argument("--key_g", type=float, default=1.0, help="Key color green (0..1)")
-    p.add_argument("--key_b", type=float, default=0.0, help="Key color blue (0..1)")
-    p.add_argument(
-        "--softness", type=float, default=0.3,
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_video")
+    parser.add_argument("--out", default="alpha_hint_frames")
+    parser.add_argument("--key_r", type=float, default=0.0, help="Key color red (0..1)")
+    parser.add_argument("--key_g", type=float, default=1.0, help="Key color green (0..1)")
+    parser.add_argument("--key_b", type=float, default=0.0, help="Key color blue (0..1)")
+    parser.add_argument(
+        "--softness",
+        type=float,
+        default=0.3,
         help="Chroma-distance transition width (0=hard, ~0.3=typical green screen)",
     )
-    p.add_argument("--gamma", type=float, default=1.0, help="Gamma bias on matte edges")
-    p.add_argument(
-        "--sat_gate", type=float, default=0.1,
+    parser.add_argument("--gamma", type=float, default=1.0, help="Gamma bias on matte edges")
+    parser.add_argument(
+        "--sat_gate",
+        type=float,
+        default=0.1,
         help="Saturation below which keying is suppressed (protects greys/whites)",
     )
-    p.add_argument("--max_frames", type=int, default=None)
-    p.add_argument(
-        "--blur_radius", type=int, default=0,
+    parser.add_argument("--max_frames", type=int, default=None)
+    parser.add_argument(
+        "--blur_radius",
+        type=int,
+        default=0,
         help="Separable box blur radius (0=off, max 8)",
     )
-    p.add_argument(
-        "--erode_iters", type=int, default=0,
+    parser.add_argument(
+        "--erode_iters",
+        type=int,
+        default=0,
         help="Erode iterations (3x3 min, removes speckle)",
     )
-    p.add_argument(
-        "--dilate_iters", type=int, default=0,
+    parser.add_argument(
+        "--dilate_iters",
+        type=int,
+        default=0,
         help="Dilate iterations (3x3 max, fills small holes)",
     )
-    args = p.parse_args()
+    args = parser.parse_args()
 
     main(
         args.input_video,

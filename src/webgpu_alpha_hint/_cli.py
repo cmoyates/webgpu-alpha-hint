@@ -13,7 +13,7 @@ def cli() -> None:
         formatter_class=RichHelpFormatter,
     )
     parser.add_argument("input_video", help="Input video file path")
-    parser.add_argument("--out", default="alpha_hint_frames", help="Output directory for masks")
+    parser.add_argument("--out", default="output", help="Output directory for masks")
     parser.add_argument("--key_r", type=float, default=0.0, help="Key color red (0..1)")
     parser.add_argument("--key_g", type=float, default=1.0, help="Key color green (0..1)")
     parser.add_argument("--key_b", type=float, default=0.0, help="Key color blue (0..1)")

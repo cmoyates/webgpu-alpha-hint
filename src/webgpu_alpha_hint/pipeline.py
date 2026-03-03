@@ -15,7 +15,7 @@ from .shader_utils import BYTES_PER_PIXEL, BYTES_PER_ROW_ALIGNMENT, MAX_BLUR_RAD
 
 def process_video(
     input_video: str,
-    out_dir: str = "alpha_hint_frames",
+    out_dir: str = "output",
     key_r: float = 0.0,
     key_g: float = 1.0,
     key_b: float = 0.0,

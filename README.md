@@ -33,6 +33,23 @@ via a smoothstep transition controlled by `--softness`.
 A **saturation gate** protects low-saturation pixels (grey, white, black) from being keyed,
 even if their chromaticity happens to land near the key color.
 
+## Architecture
+
+Single-file pipeline (`main.py`) with three WGSL compute shaders (`alpha_hint.wgsl`, `blur.wgsl`, `morphology.wgsl`). All textures are `rgba8unorm`.
+
+### GPU data flow
+
+Which texture each stage writes to changes depending on which passes are enabled:
+
+- **Key only**: key → `output_tex`
+- **Key + blur**: key → `intermediate_tex` → blur_h → `blur_temp_tex` → blur_v → `output_tex`
+- **Key + morph**: key → `morph_ping` → ping-pong erode/dilate → copy final → `output_tex`
+- **Key + blur + morph**: blur_v writes to `morph_ping` instead of `output_tex`, then morph ping-pongs, then copies to `output_tex`
+
+Morphology ping-pongs between `morph_ping` ↔ `morph_pong`. `reading_ping` bool tracks which texture holds current data.
+
+Key color is pre-normalized on CPU before upload (avoids per-pixel division in shader). Matte stored in R channel only; readback extracts `rgba_out[:, :, 0]`.
+
 ## Tuning guide
 
 | Scenario | Suggested flags |

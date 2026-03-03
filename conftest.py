@@ -28,11 +28,13 @@ def device():
 
 
 def load_wgsl(path: str) -> str:
+    """Load a WGSL shader source file."""
     with open(path, encoding="utf-8") as f:
         return f.read()
 
 
 def create_texture(device, width, height, usage):
+    """Create a 2D rgba8unorm texture with the given usage flags."""
     return device.create_texture(
         size=(width, height, 1),
         dimension=wgpu.TextureDimension.d2,
@@ -56,6 +58,7 @@ def upload_rgba(device, texture, data: np.ndarray):
 def readback_r_channel(device, texture, width, height) -> np.ndarray:
     """Read back R channel as float array (H, W) in [0, 1]."""
     bytes_per_row = width * BYTES_PER_PIXEL
+    # WebGPU spec requires bytes_per_row aligned to 256
     padded_bytes_per_row = ((bytes_per_row + 255) // 256) * 256
     readback_buffer = device.create_buffer(
         size=padded_bytes_per_row * height,
@@ -88,6 +91,7 @@ def readback_r_channel(device, texture, width, height) -> np.ndarray:
 
 
 def solid_rgba(width, height, red, green, blue, alpha=255):
+    """Create a uniform-color uint8 RGBA image."""
     image = np.zeros((height, width, 4), dtype=np.uint8)
     image[:, :] = [red, green, blue, alpha]
     return image
@@ -111,11 +115,13 @@ def matte_to_rgba(matte_float: np.ndarray) -> np.ndarray:
 
 
 def normalize_key(red, green, blue):
+    """Project key color into chromaticity space to match shader convention."""
     channel_sum = red + green + blue + 1e-4
     return red / channel_sum, green / channel_sum, blue / channel_sum
 
 
 def make_key_params(key_r=0.0, key_g=1.0, key_b=0.0, softness=0.3, gamma=1.0, sat_gate=0.1):
+    """Build the keying uniform buffer as a float32 array matching the shader's Params struct."""
     key_norm_r, key_norm_g, key_norm_b = normalize_key(key_r, key_g, key_b)
     return np.array(
         [key_norm_r, key_norm_g, key_norm_b, softness, gamma, sat_gate, 0.0, 0.0],

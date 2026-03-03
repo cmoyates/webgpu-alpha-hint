@@ -89,6 +89,8 @@ class TestKeyingShader:
 
 
 class TestBlurShader:
+    """Verify separable box blur on synthetic patterns."""
+
     def test_uniform_image_unchanged(self, device):
         """Blurring a uniform image should produce the same value."""
         img = solid_rgba(16, 16, 128, 128, 128)
@@ -123,6 +125,8 @@ class TestBlurShader:
 
 
 class TestMorphologyShader:
+    """Verify 3x3 erode/dilate on dot patterns and uniform images."""
+
     def _dot_image(self):
         """16x16 black image with a single white 3x3 block in center."""
         img = np.zeros((16, 16, 4), dtype=np.uint8)

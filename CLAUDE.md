@@ -3,7 +3,8 @@
 ## Important
 
 - Be extremely concise in all interactions and commit messages. Sacrifice grammar for the sake of being concise.
-- Always use descriptive names for variables, functions and classes
+- Always use descriptive names for variables, functions and classes.
+- Add some minimal documentation explaining why things are done a certain way, not what is being done.
 
 ## Commands
 

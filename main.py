@@ -8,6 +8,7 @@ from PIL import Image
 
 
 def load_wgsl(path: str) -> str:
+    """Load a WGSL shader source file."""
     with open(path, encoding="utf-8") as f:
         return f.read()
 
@@ -31,6 +32,11 @@ def main(
     erode_iters: int = 0,
     dilate_iters: int = 0,
 ):
+    """Run the GPU keying pipeline on a video, saving per-frame alpha masks as PNGs.
+
+    Stages run in order: chroma key -> blur -> erode -> dilate.
+    Each stage is optional; blur/morph are skipped when their params are 0.
+    """
     blur_radius = min(max(blur_radius, 0), MAX_BLUR_RADIUS)
     erode_iters = max(erode_iters, 0)
     dilate_iters = max(dilate_iters, 0)
@@ -39,7 +45,6 @@ def main(
     output_path = Path(out_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # --- Decode first frame to get size ---
     container = av.open(input_video)
     stream = container.streams.video[0]
     stream.thread_type = "AUTO"
@@ -47,13 +52,12 @@ def main(
     first_frame = next(container.decode(stream))
     frame_width, frame_height = first_frame.width, first_frame.height
 
-    # Re-open so we start from frame 0
+    # PyAV doesn't support seeking back to frame 0 after decode, so re-open
     container.close()
     container = av.open(input_video)
     stream = container.streams.video[0]
     stream.thread_type = "AUTO"
 
-    # --- WebGPU setup ---
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
     if adapter is None:
         raise RuntimeError("No WebGPU adapter found.")
@@ -61,7 +65,6 @@ def main(
 
     keying_shader = device.create_shader_module(code=load_wgsl("alpha_hint.wgsl"))
 
-    # Input texture: rgba8unorm (we upload uint8 RGBA)
     input_texture = device.create_texture(
         size=(frame_width, frame_height, 1),
         dimension=wgpu.TextureDimension.d2,
@@ -70,7 +73,6 @@ def main(
     )
     input_texture_view = input_texture.create_view()
 
-    # Output texture: final result, always needed for readback
     output_texture = device.create_texture(
         size=(frame_width, frame_height, 1),
         dimension=wgpu.TextureDimension.d2,
@@ -81,13 +83,13 @@ def main(
     )
     output_texture_view = output_texture.create_view()
 
-    # Pre-normalize key color on CPU (avoids per-pixel division in shader)
+    # Pre-normalize on CPU so the shader avoids per-pixel division
     key_channel_sum = key_r + key_g + key_b + 1e-4
     key_norm_r = key_r / key_channel_sum
     key_norm_g = key_g / key_channel_sum
     key_norm_b = key_b / key_channel_sum
 
-    # Keying params uniform: 8 x f32 = 32 bytes
+    # Padded to 32 bytes (8 x f32) to satisfy uniform buffer alignment
     keying_params_data = np.array(
         [key_norm_r, key_norm_g, key_norm_b, softness, gamma, sat_gate, 0.0, 0.0],
         dtype=np.float32,
@@ -97,7 +99,6 @@ def main(
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
 
-    # --- Key pass bind group layout (shared pattern: tex_2d + storage_tex + uniform) ---
     keying_bind_group_layout = device.create_bind_group_layout(
         entries=[
             {
@@ -126,13 +127,9 @@ def main(
         bind_group_layouts=[keying_bind_group_layout]
     )
 
-    # Determine where keying and blur write their result.
-    # If morphology follows, the pre-morph stage writes to morph_ping.
-    # Otherwise, if blur follows keying, key writes to intermediate.
-    # Otherwise, key writes directly to output.
-
+    # Texture routing: each stage writes to the next stage's input.
+    # The last active stage writes to output_texture for readback.
     if blur_radius > 0:
-        # Intermediate texture: keying result, read by horizontal blur
         keying_output_texture = device.create_texture(
             size=(frame_width, frame_height, 1),
             dimension=wgpu.TextureDimension.d2,
@@ -141,7 +138,6 @@ def main(
         )
         keying_output_view = keying_output_texture.create_view()
 
-        # Temp texture for between horizontal and vertical blur
         blur_intermediate_texture = device.create_texture(
             size=(frame_width, frame_height, 1),
             dimension=wgpu.TextureDimension.d2,
@@ -154,7 +150,7 @@ def main(
     else:
         keying_dest_view = output_texture_view
 
-    # --- Morphology ping-pong textures ---
+    # Morphology needs two textures to alternate reads/writes between iterations
     if total_morph_iters > 0:
         morphology_texture_usage = (
             wgpu.TextureUsage.STORAGE_BINDING
@@ -177,7 +173,6 @@ def main(
         )
         morph_pong_view = morph_pong_texture.create_view()
 
-        # Redirect the last pre-morph stage to write to morph_ping
         if blur_radius > 0:
             vertical_blur_dest_view = morph_ping_view
         else:
@@ -206,7 +201,6 @@ def main(
         ],
     )
 
-    # --- Blur passes (only if blur_radius > 0) ---
     if blur_radius > 0:
         blur_shader = device.create_shader_module(code=load_wgsl("blur.wgsl"))
 
@@ -269,7 +263,6 @@ def main(
             ],
         )
 
-        # vertical blur writes to morph_ping (if morph follows) or output
         vertical_blur_bind_group = device.create_bind_group(
             layout=blur_bind_group_layout,
             entries=[
@@ -286,11 +279,9 @@ def main(
             ],
         )
 
-    # --- Morphology pipelines and bind groups ---
     if total_morph_iters > 0:
         morphology_shader = device.create_shader_module(code=load_wgsl("morphology.wgsl"))
 
-        # Morphology uses same 2-binding layout: tex_2d read + storage_tex write
         morphology_bind_group_layout = device.create_bind_group_layout(
             entries=[
                 {
@@ -322,7 +313,6 @@ def main(
             compute={"module": morphology_shader, "entry_point": "dilate"},
         )
 
-        # Pre-build bind groups for ping->pong and pong->ping
         morph_bind_group_ping_to_pong = device.create_bind_group(
             layout=morphology_bind_group_layout,
             entries=[
@@ -338,8 +328,8 @@ def main(
             ],
         )
 
-        # Build iteration schedule: list of (pipeline, bind_group) tuples
-        # Data starts in morph_ping. Iterations alternate ping->pong, pong->ping.
+        # Pre-compute the full erode/dilate schedule so the per-frame loop
+        # just iterates a flat list without branching
         morphology_schedule = []
         reading_ping = True
         for _ in range(erode_iters):
@@ -355,13 +345,12 @@ def main(
             morphology_schedule.append((dilate_pipeline, bind_group))
             reading_ping = not reading_ping
 
-        # reading_ping tracks the *next* read source; the last write went to the other.
+        # reading_ping tracks the next read source; the last write went to the other
         morphology_result_texture = morph_ping_texture if reading_ping else morph_pong_texture
 
-    # Readback buffer (RGBA8)
     unpadded_bytes_per_row = frame_width * BYTES_PER_PIXEL
 
-    # WebGPU requires bytes_per_row to be multiple of 256.
+    # WebGPU spec requires bytes_per_row aligned to 256
     padded_bytes_per_row = (
         (unpadded_bytes_per_row + BYTES_PER_ROW_ALIGNMENT - 1)
         // BYTES_PER_ROW_ALIGNMENT
@@ -374,16 +363,13 @@ def main(
         usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
     )
 
-    # --- Process frames ---
     frame_index = 0
     for frame in container.decode(stream):
         if max_frames is not None and frame_index >= max_frames:
             break
 
-        # Convert to RGBA on CPU
-        rgba = frame.to_ndarray(format="rgba")  # uint8, shape (H, W, 4)
+        rgba = frame.to_ndarray(format="rgba")
 
-        # Upload frame to GPU texture
         device.queue.write_texture(
             {"texture": input_texture, "mip_level": 0, "origin": (0, 0, 0)},
             rgba.tobytes(),
@@ -395,14 +381,12 @@ def main(
         workgroup_count_x = (frame_width + 15) // 16
         workgroup_count_y = (frame_height + 15) // 16
 
-        # Pass 1: keying
         keying_pass = command_encoder.begin_compute_pass()
         keying_pass.set_pipeline(keying_pipeline)
         keying_pass.set_bind_group(0, keying_bind_group, [], 0, 999999)
         keying_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
         keying_pass.end()
 
-        # Pass 2+3: separable blur (if enabled)
         if blur_radius > 0:
             horizontal_pass = command_encoder.begin_compute_pass()
             horizontal_pass.set_pipeline(horizontal_blur_pipeline)
@@ -416,7 +400,6 @@ def main(
             vertical_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
             vertical_pass.end()
 
-        # Pass 4+: morphology iterations (if enabled)
         if total_morph_iters > 0:
             for pipeline, bind_group in morphology_schedule:
                 morphology_pass = command_encoder.begin_compute_pass()
@@ -425,7 +408,8 @@ def main(
                 morphology_pass.dispatch_workgroups(workgroup_count_x, workgroup_count_y, 1)
                 morphology_pass.end()
 
-            # Copy morph result -> output_texture for readback
+            # Morph result lands in whichever ping/pong texture was last written;
+            # copy it to output_texture so readback always reads the same buffer
             command_encoder.copy_texture_to_texture(
                 {
                     "texture": morphology_result_texture,

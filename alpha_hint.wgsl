@@ -25,34 +25,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let pixel_coords = vec2<i32>(i32(gid.x), i32(gid.y));
   let rgb = textureLoad(inputTex, pixel_coords, 0).rgb;
 
-  // Normalized chroma: project pixel into chromaticity space
+  // Project into chromaticity space so distance is hue-based, not brightness-based
   let pixel_sum = rgb.r + rgb.g + rgb.b + CHROMA_EPS;
   let pixel_norm = rgb / pixel_sum;
 
   let key_norm = vec3<f32>(params.key_norm_r, params.key_norm_g, params.key_norm_b);
 
-  // Euclidean distance in normalized-chroma space
   let chroma_dist = length(pixel_norm - key_norm);
 
-  // Map distance to alpha: close to key => 0 (background), far => 1 (foreground)
-  // softness controls the transition band width
+  // smoothstep maps chroma distance to alpha: close to key => 0, far => 1
   let half_softness = params.softness * 0.5;
   let distance_lower = max(half_softness, CHROMA_EPS);
   let distance_upper = distance_lower + params.softness;
   let smoothstep_input = clamp((chroma_dist - distance_lower) / (distance_upper - distance_lower + CHROMA_EPS), 0.0, 1.0);
-  var alpha = smoothstep_input * smoothstep_input * (3.0 - 2.0 * smoothstep_input); // smoothstep
+  var alpha = smoothstep_input * smoothstep_input * (3.0 - 2.0 * smoothstep_input);
 
-  // Saturation gate: protect low-saturation pixels (grey, white, black)
+  // Low-saturation pixels (grey/white/black) have unreliable chroma;
+  // lerp alpha toward 1.0 to protect them from false keying
   let saturation = max(rgb.r, max(rgb.g, rgb.b)) - min(rgb.r, min(rgb.g, rgb.b));
   if (saturation < params.sat_gate) {
-    // Lerp alpha toward 1.0 as saturation drops below gate
     let gate_factor = saturation / max(params.sat_gate, CHROMA_EPS);
     alpha = mix(1.0, alpha, gate_factor);
   }
 
-  // Gamma bias on edges
   alpha = pow(alpha, params.gamma);
 
-  // Write grayscale matte (no hard threshold — preserve soft edges)
   textureStore(outputTex, pixel_coords, vec4<f32>(alpha, alpha, alpha, 1.0));
 }

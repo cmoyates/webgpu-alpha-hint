@@ -18,9 +18,12 @@ MAX_BLUR_RADIUS = 8
 def main(
     input_video: str,
     out_dir: str = "alpha_hint_frames",
-    t_low: float = -0.05,
-    t_high: float = 0.10,
+    key_r: float = 0.0,
+    key_g: float = 1.0,
+    key_b: float = 0.0,
+    softness: float = 0.3,
     gamma: float = 1.0,
+    sat_gate: float = 0.1,
     max_frames: int | None = None,
     blur_radius: int = 0,
     erode_iters: int = 0,
@@ -76,8 +79,17 @@ def main(
     )
     output_view = output_tex.create_view()
 
-    # Keying params uniform
-    params_data = np.array([t_low, t_high, gamma, 0.0], dtype=np.float32)
+    # Pre-normalize key color on CPU (avoids per-pixel division in shader)
+    key_sum = key_r + key_g + key_b + 1e-4
+    key_norm_r = key_r / key_sum
+    key_norm_g = key_g / key_sum
+    key_norm_b = key_b / key_sum
+
+    # Keying params uniform: 8 x f32 = 32 bytes
+    params_data = np.array(
+        [key_norm_r, key_norm_g, key_norm_b, softness, gamma, sat_gate, 0.0, 0.0],
+        dtype=np.float32,
+    )
     params_buf = device.create_buffer_with_data(
         data=params_data.tobytes(),
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
@@ -179,7 +191,7 @@ def main(
         entries=[
             {"binding": 0, "resource": input_view},
             {"binding": 1, "resource": key_dest_view},
-            {"binding": 2, "resource": {"buffer": params_buf, "offset": 0, "size": 16}},
+            {"binding": 2, "resource": {"buffer": params_buf, "offset": 0, "size": 32}},
         ],
     )
 
@@ -442,9 +454,18 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("input_video")
     p.add_argument("--out", default="alpha_hint_frames")
-    p.add_argument("--t_low", type=float, default=-0.05)
-    p.add_argument("--t_high", type=float, default=0.10)
-    p.add_argument("--gamma", type=float, default=1.0)
+    p.add_argument("--key_r", type=float, default=0.0, help="Key color red (0..1)")
+    p.add_argument("--key_g", type=float, default=1.0, help="Key color green (0..1)")
+    p.add_argument("--key_b", type=float, default=0.0, help="Key color blue (0..1)")
+    p.add_argument(
+        "--softness", type=float, default=0.3,
+        help="Chroma-distance transition width (0=hard, ~0.3=typical green screen)",
+    )
+    p.add_argument("--gamma", type=float, default=1.0, help="Gamma bias on matte edges")
+    p.add_argument(
+        "--sat_gate", type=float, default=0.1,
+        help="Saturation below which keying is suppressed (protects greys/whites)",
+    )
     p.add_argument("--max_frames", type=int, default=None)
     p.add_argument(
         "--blur_radius", type=int, default=0,
@@ -463,9 +484,12 @@ if __name__ == "__main__":
     main(
         args.input_video,
         out_dir=args.out,
-        t_low=args.t_low,
-        t_high=args.t_high,
+        key_r=args.key_r,
+        key_g=args.key_g,
+        key_b=args.key_b,
+        softness=args.softness,
         gamma=args.gamma,
+        sat_gate=args.sat_gate,
         max_frames=args.max_frames,
         blur_radius=args.blur_radius,
         erode_iters=args.erode_iters,

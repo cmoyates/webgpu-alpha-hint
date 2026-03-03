@@ -3,11 +3,11 @@
 @group(0) @binding(1) var outputTex : texture_storage_2d<rgba8unorm, write>;
 
 struct Params {
-  t_low: f32;
-  t_high: f32;
-  gamma: f32;
-  pad: f32;
-};
+  t_low: f32,
+  t_high: f32,
+  gamma: f32,
+  pad: f32,
+}
 @group(0) @binding(2) var<uniform> params : Params;
 
 fn smooth01(x: f32, a: f32, b: f32) -> f32 {
@@ -33,6 +33,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Bias matte edges
   a = pow(a, params.gamma);
+
+  // Hard threshold: no greys, only black or white
+  a = step(0.5, a);
 
   // Write grayscale in RGB (and alpha=1)
   textureStore(outputTex, uv, vec4<f32>(a, a, a, 1.0));

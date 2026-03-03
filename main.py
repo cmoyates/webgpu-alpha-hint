@@ -38,10 +38,10 @@ def main(
     stream.thread_type = "AUTO"
 
     # --- WebGPU setup ---
-    adapter = wgpu.gpu.request_adapter(power_preference="high-performance")
+    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
     if adapter is None:
         raise RuntimeError("No WebGPU adapter found.")
-    device = adapter.request_device()
+    device = adapter.request_device_sync()
 
     shader_code = load_wgsl("alpha_hint.wgsl")
     shader = device.create_shader_module(code=shader_code)
@@ -71,8 +71,6 @@ def main(
         data=params_data.tobytes(),
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
-
-    sampler = device.create_sampler(min_filter="nearest", mag_filter="nearest")
 
     bind_group_layout = device.create_bind_group_layout(
         entries=[
@@ -169,9 +167,10 @@ def main(
         device.queue.submit([command_encoder.finish()])
 
         # Map buffer and extract the unpadded RGBA rows
-        data = readback_buf.map_read()
+        readback_buf.map_sync(mode=wgpu.MapMode.READ)
+        data = readback_buf.read_mapped()
         raw = np.frombuffer(data, dtype=np.uint8).reshape((height, padded_bpr))
-        rgba_out = raw[:, :unpadded_bpr].reshape((height, width, 4))
+        rgba_out = raw[:, :unpadded_bpr].reshape((height, width, 4)).copy()
         readback_buf.unmap()
 
         # Take grayscale from R channel (same as G,B)
